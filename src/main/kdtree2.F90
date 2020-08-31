@@ -596,9 +596,178 @@ end subroutine construct_node
 !  (all particles within a given h_i and optionally within h_j)
 !+
 !----------------------------------------------------------------
+! subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize,&
+! & ifirstincell,get_hj,fnode,remote_export)
+!  use dim,      only:maxneigh
+! #ifdef PERIODIC
+!  use boundary, only:dxbound,dybound,dzbound
+! #endif
+!  use io,       only:fatal,id
+!  use part,     only:gravity
+! #ifdef FINVSQRT
+!  use fastmath, only:finvsqrt
+! #endif
+!  use kernel,   only:radkern
+!  type(kdnode), intent(in)           :: node(ncellsmax+1)
+!  integer, intent(in)                :: ndim,ixyzcachesize
+!  real,    intent(in)                :: xpos(ndim)
+!  real,    intent(in)                :: xsizei,rcuti
+!  integer, intent(out)               :: listneigh(maxneigh)
+!  integer, intent(out)               :: nneigh
+!  real,    intent(in)                :: xyzh(:,:)
+!  real,    intent(out)               :: xyzcache(:,:)
+!  integer, intent(in)                :: ifirstincell(:)
+!  logical, intent(in)                :: get_hj
+!  real,    intent(out),    optional  :: fnode(lenfgrav)
+!  logical, intent(out),    optional  :: remote_export(:)
+!  integer, parameter :: istacksize = 300
+!  integer :: maxcache
+!  integer :: nstack(istacksize)
+!  integer :: n,istack,il,ir,npnode,i1,i2,j,jmax,nn
+!  real :: dx,dy,dz,xsizej,rcutj
+!  real :: rcut,rcut2,r2,hmax
+!  real :: xoffset,yoffset,zoffset,tree_acc2
+!  logical :: open_tree_node
+! #ifdef GRAVITY
+!  real :: quads(6)
+!  real :: dr,totmass_node
+! #endif
+! #ifdef PERIODIC
+!  real :: hdlx,hdly,hdlz
+
+!  hdlx = 0.5*dxbound
+!  hdly = 0.5*dybound
+!  hdlz = 0.5*dzbound
+! #endif
+!  tree_acc2 = tree_accuracy*tree_accuracy
+!  if (present(fnode)) fnode(:) = 0.
+!  rcut     = rcuti
+
+!  if (ixyzcachesize > 0) then
+!     maxcache = size(xyzcache(:,1))
+!  else
+!     maxcache = 0
+!  endif
+
+!  if (present(remote_export)) remote_export = .false.
+
+!  nneigh = 0
+!  istack = 1
+!  nstack(istack) = irootnode
+!  open_tree_node = .false.
+
+!  over_stack: do while(istack /= 0)
+!     n = nstack(istack)
+!     istack = istack - 1
+!     dx = xpos(1) - node(n)%xcen(1)      ! distance between node centres
+!     dy = xpos(2) - node(n)%xcen(2)
+! #ifndef TREEVIZ
+!     dz = xpos(3) - node(n)%xcen(3)
+! #endif
+!     xsizej       = node(n)%size
+!     hmax         = node(n)%hmax
+!     il           = node(n)%leftchild
+!     ir           = node(n)%rightchild
+! #ifdef GRAVITY
+!     totmass_node = node(n)%mass
+!     quads        = node(n)%quads
+! #endif
+!     !call get_child_nodes(n,il,ir)
+!     xoffset = 0.
+!     yoffset = 0.
+!     zoffset = 0.
+! #ifdef PERIODIC
+!     if (abs(dx) > hdlx) then            ! mod distances across boundary if periodic BCs
+!        xoffset = dxbound*SIGN(1.0,dx)
+!        dx = dx - xoffset
+!     endif
+!     if (abs(dy) > hdly) then
+!        yoffset = dybound*SIGN(1.0,dy)
+!        dy = dy - yoffset
+!     endif
+!     if (abs(dz) > hdlz) then
+!        zoffset = dzbound*SIGN(1.0,dz)
+!        dz = dz - zoffset
+!     endif
+! #endif
+!     r2    = dx*dx + dy*dy + dz*dz
+!     if (get_hj) then  ! find neighbours within both hi and hj
+!        rcutj = radkern*hmax
+!        rcut  = max(rcuti,rcutj)
+!     endif
+!     rcut2 = (xsizei + xsizej + rcut)**2   ! node size + search radius
+! #ifdef GRAVITY
+!     open_tree_node = tree_acc2*r2 < xsizej*xsizej    ! tree opening criterion for self-gravity
+! #endif
+!     if ((r2 < rcut2) .or. open_tree_node) then
+!        if_leaf: if (abs(ifirstincell(n)) > 0) then ! once we hit a leaf node, retrieve contents into trial neighbour cache
+!           if_global_walk: if (present(remote_export)) then
+!              ! id is stored in ipart as id + 1
+!              if (ifirstincell(n) /= (id + 1)) then
+!                 remote_export(ifirstincell(n)) = .true.
+!              endif
+!           else
+!              i1=inoderange(1,n)
+!              i2=inoderange(2,n)
+!              npnode = i2 - i1 + 1
+!              do j=1,npnode
+!                 listneigh(nneigh+j) = iorder(i1+j-1)
+!              enddo
+!              if (nneigh < ixyzcachesize) then ! not strictly necessary, loop doesn't execute anyway
+!                 nn = min(nneigh+npnode,ixyzcachesize)
+!                 !print*,' got ',nneigh+npnode,' capping to ',nn
+!                 jmax = max(nn-nneigh,0)
+!                 !print*,'cache build ',nneigh+1,'->',nneigh+jmax,'parts ',i1,'->',i1+jmax-1,&
+!                   !  ' nneigh = ',nneigh+1,'->',nneigh+npnode
+!                 if (maxcache >= 4) then
+!                    do j=1,jmax
+!                       xyzcache(1,nneigh+j) = treecache(1,i1+j-1) + xoffset
+!                       xyzcache(2,nneigh+j) = treecache(2,i1+j-1) + yoffset
+!                       xyzcache(3,nneigh+j) = treecache(3,i1+j-1) + zoffset
+!                       xyzcache(4,nneigh+j) = 1./treecache(4,i1+j-1)
+!                    enddo
+!                 else
+!                    do j=1,jmax
+!                       xyzcache(1,nneigh+j) = treecache(1,i1+j-1) + xoffset
+!                       xyzcache(2,nneigh+j) = treecache(2,i1+j-1) + yoffset
+!                       xyzcache(3,nneigh+j) = treecache(3,i1+j-1) + zoffset
+!                    enddo
+!                 endif
+!              endif
+!              nneigh = nneigh + npnode
+!           endif if_global_walk
+!        else
+!           if (istack+2 > istacksize) call fatal('getneigh','stack overflow in getneigh')
+!           if (il /= 0) then
+!              istack = istack + 1
+!              nstack(istack) = il
+!           endif
+!           if (ir /= 0) then
+!              istack = istack + 1
+!              nstack(istack) = ir
+!           endif
+!        endif if_leaf
+! #ifdef GRAVITY
+!     elseif (present(fnode) .and. ((.not. present(remote_export)) .or. n < 2*nprocs-1)) then
+! !
+! !--long range force on node due to distant node, along node centres
+! !  along with derivatives in order to perform series expansion
+! !
+! #ifdef FINVSQRT
+!        dr = finvsqrt(r2)
+! #else
+!        dr = 1./sqrt(r2)
+! #endif
+!        call compute_fnode(dx,dy,dz,dr,totmass_node,quads,fnode)
+! #endif
+!     endif
+!  enddo over_stack
+
+! end subroutine getneigh
+
 subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize,&
-& ifirstincell,get_hj,fnode,remote_export)
- use dim,      only:maxneigh
+& ifirstincell,get_hj,fnode,remote_export,currentnodeindex,interactnodeindex)
+use dim,      only:maxneigh
 #ifdef PERIODIC
  use boundary, only:dxbound,dybound,dzbound
 #endif
@@ -609,6 +778,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,i
 #endif
  use kernel,   only:radkern
  type(kdnode), intent(in)           :: node(ncellsmax+1)
+ integer, intent(in), optional      :: currentnodeindex,interactnodeindex
  integer, intent(in)                :: ndim,ixyzcachesize
  real,    intent(in)                :: xpos(ndim)
  real,    intent(in)                :: xsizei,rcuti
@@ -638,6 +808,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,i
  hdlx = 0.5*dxbound
  hdly = 0.5*dybound
  hdlz = 0.5*dzbound
+ !print*, "periodic"
 #endif
  tree_acc2 = tree_accuracy*tree_accuracy
  if (present(fnode)) fnode(:) = 0.
@@ -649,28 +820,38 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,i
     maxcache = 0
  endif
 
+ !n = 1
+
+ ! ADD PEROIDIC STUFF BACK IN 
+
  if (present(remote_export)) remote_export = .false.
 
+ if (present(interactnodeindex) .and. interactnodeindex > 0) n = interactnodeindex
+
+
+ !print*, "xpos", xpos
+ !print*, "interactnode", interactnodeindex
+ !print*, "n",n
+
  nneigh = 0
+!listneigh = 0
  istack = 1
  nstack(istack) = irootnode
  open_tree_node = .false.
 
- over_stack: do while(istack /= 0)
-    n = nstack(istack)
-    istack = istack - 1
-    dx = xpos(1) - node(n)%xcen(1)      ! distance between node centres
-    dy = xpos(2) - node(n)%xcen(2)
+  dx = xpos(1) - node(n)%xcen(1)      ! distance between node centres
+  dy = xpos(2) - node(n)%xcen(2)
 #ifndef TREEVIZ
-    dz = xpos(3) - node(n)%xcen(3)
+  dz = xpos(3) - node(n)%xcen(3)
 #endif
-    xsizej       = node(n)%size
-    hmax         = node(n)%hmax
-    il           = node(n)%leftchild
-    ir           = node(n)%rightchild
+  xsizej       = node(n)%size
+  hmax         = node(n)%hmax
+  il           = node(n)%leftchild
+  ir           = node(n)%rightchild
 #ifdef GRAVITY
-    totmass_node = node(n)%mass
-    quads        = node(n)%quads
+  "def grav"
+  totmass_node = node(n)%mass
+  quads        = node(n)%quads
 #endif
     !call get_child_nodes(n,il,ir)
     xoffset = 0.
@@ -696,17 +877,16 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,i
        rcut  = max(rcuti,rcutj)
     endif
     rcut2 = (xsizei + xsizej + rcut)**2   ! node size + search radius
-#ifdef GRAVITY
-    open_tree_node = tree_acc2*r2 < xsizej*xsizej    ! tree opening criterion for self-gravity
-#endif
-    if ((r2 < rcut2) .or. open_tree_node) then
+!#ifdef GRAVITY
+
+  !if ((r2 < rcut2) .or. open_tree_node) then
        if_leaf: if (abs(ifirstincell(n)) > 0) then ! once we hit a leaf node, retrieve contents into trial neighbour cache
-          if_global_walk: if (present(remote_export)) then
-             ! id is stored in ipart as id + 1
-             if (ifirstincell(n) /= (id + 1)) then
-                remote_export(ifirstincell(n)) = .true.
-             endif
-          else
+         !if_global_walk: if (present(remote_export)) then
+          !   ! id is stored in ipart as id + 1
+          !   if (ifirstincell(n) /= (id + 1)) then
+          !      remote_export(ifirstincell(n)) = .true.
+           !  endif
+          !else
              i1=inoderange(1,n)
              i2=inoderange(2,n)
              npnode = i2 - i1 + 1
@@ -735,33 +915,12 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,i
                 endif
              endif
              nneigh = nneigh + npnode
-          endif if_global_walk
-       else
-          if (istack+2 > istacksize) call fatal('getneigh','stack overflow in getneigh')
-          if (il /= 0) then
-             istack = istack + 1
-             nstack(istack) = il
-          endif
-          if (ir /= 0) then
-             istack = istack + 1
-             nstack(istack) = ir
-          endif
+          !endif if_global_walk
        endif if_leaf
-#ifdef GRAVITY
-    elseif (present(fnode) .and. ((.not. present(remote_export)) .or. n < 2*nprocs-1)) then
-!
-!--long range force on node due to distant node, along node centres
-!  along with derivatives in order to perform series expansion
-!
-#ifdef FINVSQRT
-       dr = finvsqrt(r2)
-#else
-       dr = 1./sqrt(r2)
-#endif
-       call compute_fnode(dx,dy,dz,dr,totmass_node,quads,fnode)
-#endif
-    endif
- enddo over_stack
+  !endif 
+
+  !print*, "Neighbours inside:  ", listneigh(1:nneigh)
+  !if (nneigh > 0) stop 
 
 end subroutine getneigh
 

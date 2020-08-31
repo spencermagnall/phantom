@@ -174,7 +174,7 @@ end subroutine get_distance_from_centre_of_mass
 
 subroutine set_linklist(npart,nactive,xyzh,vxyzu)
  use dtypekdtree,  only:ndimtree
- use kdtree,       only:maketree
+ use kdtree,       only:maketree,revtree
 #ifdef MPI
  use kdtree,       only: maketreeglobal
 #endif
@@ -195,6 +195,7 @@ subroutine set_linklist(npart,nactive,xyzh,vxyzu)
 #else
  call getused(t1)
  call maketree(node,xyzh,npart,ndimtree,ifirstincell,ncells)
+ !call revtree(node, xyzh, ifirstincell, ncells)
  call getused(t2)
  print*,' TIMING = ',t2-t1
 #endif
@@ -209,9 +210,10 @@ end subroutine set_linklist
 ! the list is returned in 'listneigh' (length nneigh)
 !+
 !-----------------------------------------------------------------------
-subroutine get_neighbour_list(inode,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize, &
+subroutine get_neighbour_list(inode,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize,  &
                               getj,f,remote_export, &
-                              cell_xpos,cell_xsizei,cell_rcuti,local_gravity)
+                              cell_xpos,cell_xsizei,cell_rcuti,local_gravity,currentnodeindex,interactnodeindex)
+
  use kdtree, only:getneigh,lenfgrav
  use kernel, only:radkern
 #ifdef PERIODIC
@@ -223,6 +225,7 @@ subroutine get_neighbour_list(inode,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize
  integer, intent(out) :: nneigh
  real,    intent(in)  :: xyzh(4,maxp)
  real,    intent(out) :: xyzcache(:,:)
+ integer, intent(in),  optional :: currentnodeindex, interactnodeindex
  logical, intent(in),  optional :: getj
  real,    intent(out), optional :: f(lenfgrav)
  logical, intent(out), optional :: remote_export(:)
@@ -240,6 +243,7 @@ subroutine get_neighbour_list(inode,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize
     xsizei = cell_xsizei
     rcuti = cell_rcuti
  else
+    !print*, "Getting cell location"
     call get_cell_location(inode,xpos,xsizei,rcuti)
  endif
 
@@ -262,10 +266,12 @@ subroutine get_neighbour_list(inode,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize
 #ifdef MPI
     if (present(remote_export)) then
        remote_export = .false.
+       print*, "Calling first "
        call getneigh(nodeglobal,xpos,xsizei,rcuti,3,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize,&
                 cellatid,get_j,fgrav_global,remote_export=remote_export)
     endif
 #endif
+    print*, "Calling second"
     call getneigh(node,xpos,xsizei,rcuti,3,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize,&
               ifirstincell,get_j,fgrav)
     if (present(local_gravity)) then
@@ -277,12 +283,14 @@ subroutine get_neighbour_list(inode,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize
 #ifdef MPI
     if (present(remote_export)) then
        remote_export = .false.
+       print*,"Calling third"
        call getneigh(nodeglobal,xpos,xsizei,rcuti,3,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize,&
               cellatid,get_j,remote_export=remote_export)
     endif
 #endif
+    !print*, "Calling fourth"
     call getneigh(node,xpos,xsizei,rcuti,3,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize,&
-               ifirstincell,get_j)
+               ifirstincell,get_j, interactnodeindex=interactnodeindex)
  endif
 
 end subroutine get_neighbour_list

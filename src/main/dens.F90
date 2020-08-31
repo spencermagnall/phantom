@@ -33,6 +33,8 @@ module densityforce
  use mpidens, only:celldens,stackdens
  use timing,  only:getused,printused,print_time
 
+
+
  implicit none
  character(len=80), parameter, public :: &  ! module version
     modid="$Id$"
@@ -104,6 +106,8 @@ module densityforce
        iradfzi          = irhodustiend + 3
 
 
+ 
+
  !--kernel related parameters
  !real, parameter    :: cnormk = 1./pi, wab0 = 1., gradh0 = -3.*wab0, radkern2 = 4F.0
  integer, parameter :: isizecellcache = 50000
@@ -116,6 +120,15 @@ module densityforce
  integer(kind=8), private :: nneightry,maxneightry,nneighact,ncalc
  integer(kind=8), private :: nptot = -1
 
+ type denstreestacklocal
+  integer :: nodeindex1 = 0 , nodeindex2 = 0
+ end type 
+
+ type denstreestack
+  integer :: nodeindex1 = 0
+  integer :: interactions(2) = 0 
+ end type 
+
  private
 
 contains
@@ -125,13 +138,466 @@ contains
 !  this is the main routine for the whole code
 !+
 !----------------------------------------------------------------
+! subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,stressmax,&
+!                           fxyzu,fext,alphaind,gradh,rad,radprop)
+!  use dim,       only:maxp,maxneigh,ndivcurlv,ndivcurlB,maxvxyzu,maxalpha, &
+!                      mhd_nonideal,nalpha,use_dust
+!  use io,        only:iprint,fatal,iverbose,id,master,real4,warning,error,nprocs
+!  use linklist,  only:ifirstincell,get_neighbour_list,get_hmaxcell,get_cell_list,&
+!                      get_cell_location,set_hmaxcell,sync_hmax_mpi,update_hmax_remote,node_is_active
+!  use part,      only:mhd,rhoh,dhdrho,rhoanddhdrho,&
+!                      ll,get_partinfo,iactive,&
+!                      hrho,iphase,igas,idust,iamgas,periodic,&
+!                      all_active,dustfrac,Bxyz,set_boundaries_to_active
+! #ifdef FINVSQRT
+!  use fastmath,  only:finvsqrt
+! #endif
+
+!  use mpiutils,  only:reduceall_mpi,barrier_mpi,reduce_mpi,reduceall_mpi
+! #ifdef MPI
+!  use stack,     only:reserve_stack,swap_stacks
+!  use stack,     only:stack_remote => dens_stack_1
+!  use stack,     only:stack_waiting => dens_stack_2
+!  use stack,     only:stack_redo => dens_stack_3
+!  use mpiderivs, only:send_cell,recv_cells,check_send_finished,init_cell_exchange, &
+!                      finish_cell_exchange,recv_while_wait,reset_cell_counters
+! #endif
+!  use timestep,  only:rhomaxnow
+!  use part,      only:ngradh
+!  use viscosity, only:irealvisc
+!  use io_summary,only:summary_variable,iosumhup,iosumhdn
+!  integer,      intent(in)    :: icall,npart,nactive
+!  real,         intent(inout) :: xyzh(:,:)
+!  real,         intent(in)    :: vxyzu(:,:),fxyzu(:,:),fext(:,:)
+!  real,         intent(in)    :: Bevol(:,:)
+!  real(kind=4), intent(out)   :: divcurlv(:,:)
+!  real(kind=4), intent(out)   :: divcurlB(:,:)
+!  real(kind=4), intent(out)   :: alphaind(:,:)
+!  real(kind=4), intent(out)   :: gradh(:,:)
+!  real,         intent(out)   :: stressmax
+!  real,         intent(in)    :: rad(:,:)
+!  real,         intent(inout) :: radprop(:,:)
+
+!  integer, save :: listneigh(maxneigh)
+!  real,   save :: xyzcache(3,isizecellcache)
+! !$omp threadprivate(xyzcache,listneigh)
+
+!  integer :: i,icell
+!  integer :: nneigh,np
+!  integer :: nwarnup,nwarndown,nwarnroundoff
+
+!  logical :: getdv,realviscosity,getdB,converged
+!  logical :: iactivei,iamgasi,iamdusti
+!  integer :: iamtypei
+
+!  logical :: remote_export(nprocs)
+
+!  real    :: rhomax
+
+!  integer                   :: npcell,istart,iend
+
+!  type(celldens)            :: cell
+
+!  logical                   :: redo_neighbours
+
+! #ifdef MPI
+!  integer                   :: j,k,l
+!  integer                   :: irequestsend(nprocs),irequestrecv(nprocs)
+!  type(celldens)            :: xrecvbuf(nprocs),xsendbuf
+!  integer                   :: mpiits,nlocal
+!  real                      :: ntotal
+!  logical                   :: iterations_finished
+!  logical                   :: do_export
+
+!  call init_cell_exchange(xrecvbuf,irequestrecv)
+!  stack_waiting%n = 0
+!  stack_remote%n = 0
+!  stack_redo%n = 0
+! #endif
+
+!  if (iverbose >= 3 .and. id==master) &
+!     write(iprint,*) ' cell cache =',isizecellcache,' neigh cache = ',isizeneighcache,' icall = ',icall
+
+!  if (icall==0 .or. icall==1) then
+!     call reset_neighbour_stats(nneightry,nneighact,maxneightry,maxneighact,ncalc,nrelink)
+!     nwarnup       = 0
+!     nwarndown     = 0
+!     nwarnroundoff = 0
+!     np = 0
+!  endif
+!  !
+!  ! flag for whether or not we need to calculate velocity derivatives
+!  ! whilst doing the density iterations (needed for viscosity switches
+!  ! and for physical viscosity)
+!  !
+!  realviscosity = (irealvisc > 0)
+!  getdv = ((maxalpha==maxp .or. ndivcurlv >= 4) .and. icall <= 1) .or. &
+!          (maxdvdx==maxp .and. (use_dust .or. realviscosity))
+!  if (getdv .and. ndivcurlv < 1) call fatal('densityiterate','divv not stored but it needs to be')
+!  getdB = (mhd .and. (ndivcurlB >= 4 .or. mhd_nonideal))
+
+!  if ( all_active ) stressmax  = 0.   ! condition is required for independent timestepping
+
+
+! #ifdef MPI
+!  ! number of local only cells
+!  nlocal = 0
+!  call reset_cell_counters
+
+! #endif
+
+!  rhomax = 0.0
+!  call get_cell_list(istart,iend)
+
+! !$omp parallel default(none) &
+! !$omp shared(icall,istart,iend) &
+! !!$omp shared(ncells) &
+! !!$omp shared(ll) &
+! !$omp shared(ifirstincell) &
+! !$omp shared(xyzh) &
+! !$omp shared(vxyzu) &
+! !$omp shared(fxyzu) &
+! !$omp shared(fext) &
+! !$omp shared(gradh) &
+! !$omp shared(iphase) &
+! !$omp shared(Bevol) &
+! !$omp shared(divcurlv) &
+! !$omp shared(divcurlB) &
+! !$omp shared(alphaind) &
+! !$omp shared(dustfrac) &
+! !$omp shared(Bxyz) &
+! !$omp shared(dvdx) &
+! !$omp shared(id) &
+! !$omp shared(nprocs) &
+! !$omp shared(getdB) &
+! !$omp shared(getdv) &
+! !$omp shared(realviscosity) &
+! !$omp shared(iverbose) &
+! !$omp shared(iprint) &
+! !$omp shared(rad,radprop)&
+! #ifdef MPI
+! !$omp shared(xrecvbuf) &
+! !$omp shared(xsendbuf) &
+! !$omp shared(irequestrecv) &
+! !$omp shared(irequestsend) &
+! !$omp shared(stack_remote) &
+! !$omp shared(stack_waiting) &
+! !$omp shared(stack_redo) &
+! !$omp shared(iterations_finished) &
+! !$omp shared(mpiits) &
+! !$omp reduction(+:nlocal) &
+! !$omp private(do_export) &
+! !$omp private(j) &
+! !$omp private(k) &
+! !$omp private(l) &
+! !$omp private(ntotal) &
+! #endif
+! !$omp private(remote_export) &
+! !$omp private(nneigh) &
+! !$omp private(npcell) &
+! !$omp private(cell) &
+! !$omp private(iamgasi) &
+! !$omp private(iamtypei) &
+! !$omp private(iactivei) &
+! !$omp private(iamdusti) &
+! !$omp private(converged) &
+! !$omp private(redo_neighbours) &
+! !$omp reduction(+:ncalc) &
+! !$omp reduction(+:np) &
+! !$omp reduction(max:maxneighact) &
+! !$omp reduction(max:maxneightry) &
+! !$omp reduction(+:nneighact) &
+! !$omp reduction(+:nneightry) &
+! !$omp reduction(+:nrelink) &
+! !$omp reduction(+:stressmax) &
+! !$omp reduction(max:rhomax) &
+! !$omp private(i)
+
+! !$omp do schedule(runtime)
+!   over_leaf_nodes: do icell=istart,iend
+! ! over_cells: do icell=1,int(ncells)
+!     if (ifirstincell(icell) <= 0) cycle over_leaf_nodes
+! !    if (.not.node_is_active(icell)) cycle over_leaf_nodes
+
+!     !
+!     !--get the neighbour list and fill the cell cache
+!     !
+!     call get_neighbour_list(icell,listneigh,nneigh,xyzh,xyzcache,isizecellcache,getj=.false., &
+!                            remote_export=remote_export)
+! #ifdef MPI
+!     if (any(remote_export)) then
+!        do_export = .true.
+!     else
+!        do_export = .false.
+!     endif
+! #endif
+!     cell%icell                   = icell
+! #ifdef MPI
+!     cell%owner                   = id
+! #endif
+!     cell%nits                    = 0
+!     cell%nneigh                  = 0
+!     cell%remote_export(1:nprocs) = remote_export
+
+!     call start_cell(cell,iphase,xyzh,vxyzu,fxyzu,fext,Bevol,rad)
+
+!     call get_cell_location(icell,cell%xpos,cell%xsizei,cell%rcuti)
+!     call get_hmaxcell(icell,cell%hmax)
+
+! #ifdef MPI
+! !$omp critical
+!     call recv_cells(stack_remote,xrecvbuf,irequestrecv)
+! !$omp end critical
+
+!     if (do_export) then
+! !$omp critical
+!        if (stack_waiting%n > 0) call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
+!        ! make a reservation on the stack
+!        call reserve_stack(stack_waiting,cell%waiting_index)
+!        ! export the cell: direction 0 for exporting
+!        call send_cell(cell,0,irequestsend,xsendbuf)
+! !$omp end critical
+!     endif
+! #endif
+
+!     call compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,rad)
+
+! #ifdef MPI
+!     if (do_export) then
+!        ! write directly to stack
+!        stack_waiting%cells(cell%waiting_index) = cell
+!     else
+! #endif
+!        converged = .false.
+!        local_its: do while (.not. converged)
+!           call finish_cell(cell,converged)
+!           call compute_hmax(cell,redo_neighbours)
+!           if (icall == 0) converged = .true.
+!           if (.not. converged) then
+!              if (redo_neighbours) then
+!                 call set_hmaxcell(cell%icell,cell%hmax)
+!                 call get_neighbour_list(-1,listneigh,nneigh,xyzh,xyzcache,isizecellcache,getj=.false., &
+!                                       cell_xpos=cell%xpos,cell_xsizei=cell%xsizei,cell_rcuti=cell%rcuti, &
+!                                       remote_export=remote_export)
+! #ifdef MPI
+!                 cell%remote_export(1:nprocs) = remote_export
+!                 if (any(remote_export)) then
+!                    do_export = .true.
+! !$omp critical
+!                    if (stack_waiting%n > 0) call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
+!                    call reserve_stack(stack_waiting,cell%waiting_index)
+!                    ! direction export (0)
+!                    call send_cell(cell,0,irequestsend,xsendbuf)
+! !$omp end critical
+!                 endif
+! #endif
+!                 nrelink = nrelink + 1
+!              endif
+!              call compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,rad)
+! #ifdef MPI
+!              if (do_export) then
+!                 stack_waiting%cells(cell%waiting_index) = cell
+!                 exit local_its
+!              endif
+! #endif
+!           endif
+!        enddo local_its
+! #ifdef MPI
+!        if (.not. do_export) then
+! #endif
+!           call store_results(icall,cell,getdv,getdB,realviscosity,stressmax,xyzh,gradh,divcurlv,divcurlB,alphaind, &
+!                              dvdx,vxyzu,Bxyz,dustfrac,rhomax,nneightry,nneighact,maxneightry,maxneighact,np,ncalc,&
+!                              radprop)
+! #ifdef MPI
+!           nlocal = nlocal + 1
+!        endif
+!     endif
+! #endif
+!  enddo over_leaf_nodes
+! !$omp enddo
+
+! #ifdef MPI
+! !$omp barrier
+
+! !$omp single
+!  if (stack_waiting%n > 0) call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
+!  call recv_while_wait(stack_remote,xrecvbuf,irequestrecv,irequestsend)
+! !$omp end single
+
+! !$omp single
+!  if (iverbose>=6) then
+!     ntotal = real(nlocal) + real(stack_waiting%n)
+!     if (ntotal > 0) then
+!        write(iprint,*) id,'local ratio = ',real(nlocal)/ntotal
+!     else
+!        write(iprint,*) id,'local ratio = 0'
+!     endif
+!  endif
+
+!  mpiits = 0
+!  iterations_finished = .false.
+! !$omp end single
+!  remote_its: do while(.not. iterations_finished)
+! !$omp single
+!     mpiits = mpiits + 1
+!     call reset_cell_counters
+! !$omp end single
+
+!     igot_remote: if (stack_remote%n > 0) then
+! !$omp do schedule(runtime)
+!        over_remote: do i = 1,stack_remote%n
+!           cell = stack_remote%cells(i)
+
+!           ! icell is unused (-1 here)
+!           call get_neighbour_list(-1,listneigh,nneigh,xyzh,xyzcache,isizecellcache,getj=.false., &
+!                                   cell_xpos=cell%xpos,cell_xsizei=cell%xsizei,cell_rcuti=cell%rcuti)
+
+!           call compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,&
+!                             rad)
+
+!           cell%remote_export(id+1) = .false.
+
+!           ! communication happened while computing contributions to remote cells
+! !$omp critical
+!           call recv_cells(stack_waiting,xrecvbuf,irequestrecv)
+!           call check_send_finished(stack_waiting,irequestsend,irequestrecv,xrecvbuf)
+!           ! direction return (1)
+!           call send_cell(cell,1,irequestsend,xsendbuf)
+! !$omp end critical
+!        enddo over_remote
+! !$omp enddo
+! !$omp barrier
+! !$omp single
+!        ! reset remote stack
+!        stack_remote%n = 0
+!        ! ensure send has finished
+!        call check_send_finished(stack_waiting,irequestsend,irequestrecv,xrecvbuf)
+! !$omp end single
+!     endif igot_remote
+! !$omp barrier
+! !$omp single
+!     call recv_while_wait(stack_waiting,xrecvbuf,irequestrecv,irequestsend)
+!     call reset_cell_counters
+! !$omp end single
+!     iam_waiting: if (stack_waiting%n > 0) then
+! !$omp do schedule(runtime)
+!        over_waiting: do i = 1, stack_waiting%n
+!           cell = stack_waiting%cells(i)
+
+!           if (any(cell%remote_export(1:nprocs))) then
+!              print*,id,cell%remote_export(1:nprocs)
+!              print*,id,'mpiits',mpiits
+!              print*,id,'owner',cell%owner
+!              print*,id,'icell',cell%icell
+!              print*,id,'npcell',cell%npcell
+!              print*,id,'xpos',cell%xpos
+!              print*,id,'stackpos',i
+!              print*,id,'waitindex',cell%waiting_index
+!              call fatal('dens', 'not all results returned from remote processor')
+!           endif
+
+!           call finish_cell(cell,converged)
+!           call compute_hmax(cell,redo_neighbours)
+
+!           ! communication happened while finishing cell
+! !$omp critical
+!           call recv_cells(stack_remote,xrecvbuf,irequestrecv)
+! !$omp end critical
+!           if (.not. converged) then
+!              call set_hmaxcell(cell%icell,cell%hmax)
+!              call get_neighbour_list(-1,listneigh,nneigh,xyzh,xyzcache,isizecellcache,getj=.false., &
+!                                     cell_xpos=cell%xpos,cell_xsizei=cell%xsizei,cell_rcuti=cell%rcuti, &
+!                                     remote_export=remote_export)
+!              cell%remote_export(1:nprocs) = remote_export
+! !$omp critical
+!              call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
+!              call reserve_stack(stack_redo,cell%waiting_index)
+!              ! direction export (0)
+!              call send_cell(cell,0,irequestsend,xsendbuf)
+! !$omp end critical
+!              call compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,&
+!              rad)
+
+!              stack_redo%cells(cell%waiting_index) = cell
+!           else
+!              call store_results(icall,cell,getdv,getdB,realviscosity,stressmax,xyzh,gradh,divcurlv,divcurlB,alphaind, &
+!                                 dvdx,vxyzu,Bxyz,dustfrac,rhomax,nneightry,nneighact,maxneightry,maxneighact,np,ncalc,&
+!                                 radprop)
+
+!           endif
+
+!        enddo over_waiting
+! !$omp enddo
+! !$omp barrier
+! !$omp single
+!        ! reset stacks
+!        stack_waiting%n = 0
+!        call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
+! !$omp end single
+!     endif iam_waiting
+! !$omp barrier
+! !$omp single
+!     call recv_while_wait(stack_remote,xrecvbuf,irequestrecv,irequestsend)
+! !$omp end single
+
+! !$omp single
+!     if (reduceall_mpi('max',stack_redo%n) > 0) then
+!        call swap_stacks(stack_waiting, stack_redo)
+!     else
+!        iterations_finished = .true.
+!     endif
+!     stack_redo%n = 0
+! !$omp end single
+
+!  enddo remote_its
+
+! #endif
+! !$omp end parallel
+
+!  !call update_hmax_remote
+
+! #ifdef MPI
+!  call finish_cell_exchange(irequestrecv,xsendbuf)
+!  call sync_hmax_mpi
+! #endif
+
+!  !--reduce values
+!  if (realviscosity .and. maxdvdx==maxp) then
+!     stressmax = reduceall_mpi('max',stressmax)
+!  endif
+!  rhomax    = reduceall_mpi('max',rhomax)
+!  rhomaxnow = rhomax
+
+!  !--boundary particles are no longer treated as active
+!  set_boundaries_to_active = .false.
+
+!  if (realviscosity .and. maxdvdx==maxp .and. stressmax > 0. .and. iverbose > 0 .and. id==master) then
+!     call warning('force','applying negative stress correction',var='max',val=-stressmax)
+!  endif
+! !
+! !--warnings
+! !
+!  if (icall==1) then
+!     if (nwarnup   > 0) call summary_variable('hupdn',iosumhup,0,real(nwarnup  ))
+!     if (nwarndown > 0) call summary_variable('hupdn',iosumhdn,0,real(nwarndown))
+!     if (iverbose  >=1) call reduce_and_print_warnings(nwarnup,nwarndown,nwarnroundoff)
+!  endif
+! !
+! !--diagnostics
+! !
+!  if (icall==0 .or. icall==1) call reduce_and_print_neighbour_stats(np)
+
+! end subroutine densityiterate
+
 subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,stressmax,&
-                          fxyzu,fext,alphaind,gradh,rad,radprop)
+                           fxyzu,fext,alphaind,gradh,rad,radprop)
+ !$ use omputils
+ use omp_lib
  use dim,       only:maxp,maxneigh,ndivcurlv,ndivcurlB,maxvxyzu,maxalpha, &
                      mhd_nonideal,nalpha,use_dust
  use io,        only:iprint,fatal,iverbose,id,master,real4,warning,error,nprocs
- use linklist,  only:ifirstincell,get_neighbour_list,get_hmaxcell,get_cell_list,&
-                     get_cell_location,set_hmaxcell,sync_hmax_mpi,update_hmax_remote,node_is_active
+ use linklist,  only:ifirstincell,ncells,get_neighbour_list,get_hmaxcell,get_cell_list,&
+                     get_cell_location,set_hmaxcell,sync_hmax_mpi,update_hmax_remote,node_is_active, node 
  use part,      only:mhd,rhoh,dhdrho,rhoanddhdrho,&
                      ll,get_partinfo,iactive,&
                      hrho,iphase,igas,idust,iamgas,periodic,&
@@ -183,9 +649,17 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
 
  integer                   :: npcell,istart,iend
 
- type(celldens)            :: cell
+ type(celldens),allocatable            :: celllist(:)
+ type(celldens)            :: cell 
 
  logical                   :: redo_neighbours
+ type(denstreestack)       :: stack(1000)
+ type(denstreestacklocal)  :: stacklocal(1000)
+ integer                   :: top,nodeindex1, nodeindex2, leftindex, rightindex, regnodeindex, splitnodeindex, numthreads
+ integer, allocatable      :: istacklocal(:)
+ integer                   :: k 
+ logical, allocatable      :: threadworking(:)
+  integer                   :: numnotconverged
 
 #ifdef MPI
  integer                   :: j,k,l
@@ -196,13 +670,16 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
  logical                   :: iterations_finished
  logical                   :: do_export
 
+  
+ 
+
  call init_cell_exchange(xrecvbuf,irequestrecv)
  stack_waiting%n = 0
  stack_remote%n = 0
  stack_redo%n = 0
 #endif
 
- if (iverbose >= 3 .and. id==master) &
+  if (iverbose >= 3 .and. id==master) &
     write(iprint,*) ' cell cache =',isizecellcache,' neigh cache = ',isizeneighcache,' icall = ',icall
 
  if (icall==0 .or. icall==1) then
@@ -235,6 +712,28 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
 
  rhomax = 0.0
  call get_cell_list(istart,iend)
+
+ !top = 1
+ !stack(top) % nodeindex1 = 1
+ !stack(top) % interactions(1) = 1 
+
+!print*,size(node)
+
+!!$omp parallel default(none) shared(numthreads)
+!     numthreads = omp_get_num_threads()
+!!$omp end parallel
+
+allocate(istacklocal(numthreads))
+allocate(threadworking(numthreads))
+allocate(celllist(size(node)))
+
+threadworking = .false. 
+
+istacklocal = 0
+
+numnotconverged = 0
+
+
 
 !$omp parallel default(none) &
 !$omp shared(icall,istart,iend) &
@@ -298,283 +797,531 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
 !$omp reduction(+:nrelink) &
 !$omp reduction(+:stressmax) &
 !$omp reduction(max:rhomax) &
-!$omp private(i)
+!$omp private(i,k,stacklocal,istacklocal,nodeindex1,nodeindex2,leftindex,rightindex,splitnodeindex,regnodeindex) &
+!$omp shared(stack,top,node,threadworking,ncells,celllist,numnotconverged)
 
-!$omp do schedule(runtime)
-  over_leaf_nodes: do icell=istart,iend
-! over_cells: do icell=1,int(ncells)
-    if (ifirstincell(icell) <= 0) cycle over_leaf_nodes
-!    if (.not.node_is_active(icell)) cycle over_leaf_nodes
+!$omp do 
+ do i=1,ncells
+ if (ifirstincell(i) > 0) then 
+     !print*, i 
+      !stop 
+      celllist(i)%icell                   = i
+      celllist(i)%nits                    = 0
+      celllist(i)%nneigh                  = 0
+      celllist(i)%remote_export(1:nprocs) = remote_export
+      celllist(i)%rhosums = 0
+      call start_cell(celllist(i),iphase,xyzh,vxyzu,fxyzu,fext,Bevol,rad)
+      call get_cell_location(i,celllist(i)%xpos,celllist(i)%xsizei,celllist(i)%rcuti)
+      !print*,"cell xpos ", celllist(i) % xpos 
+      !stop 
+      call get_hmaxcell(i,celllist(i)%hmax)
 
-    !
-    !--get the neighbour list and fill the cell cache
-    !
-    call get_neighbour_list(icell,listneigh,nneigh,xyzh,xyzcache,isizecellcache,getj=.false., &
-                           remote_export=remote_export)
-#ifdef MPI
-    if (any(remote_export)) then
-       do_export = .true.
-    else
-       do_export = .false.
-    endif
-#endif
-    cell%icell                   = icell
-#ifdef MPI
-    cell%owner                   = id
-#endif
-    cell%nits                    = 0
-    cell%nneigh                  = 0
-    cell%remote_export(1:nprocs) = remote_export
+ endif 
+ enddo 
 
-    call start_cell(cell,iphase,xyzh,vxyzu,fxyzu,fext,Bevol,rad)
+!$omp end do 
 
-    call get_cell_location(icell,cell%xpos,cell%xsizei,cell%rcuti)
-    call get_hmaxcell(icell,cell%hmax)
+!$omp end parallel 
+!print*, "Setup cells correctly"
 
-#ifdef MPI
-!$omp critical
-    call recv_cells(stack_remote,xrecvbuf,irequestrecv)
-!$omp end critical
+!!$omp single 
+call dual_traversal(celllist, icall,xyzh,vxyzu,divcurlv,divcurlB,Bevol,stressmax,&
+                           fxyzu,fext,alphaind,gradh,rad,radprop)
+!!$omp end single 
+!stop 
 
-    if (do_export) then
-!$omp critical
-       if (stack_waiting%n > 0) call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
-       ! make a reservation on the stack
-       call reserve_stack(stack_waiting,cell%waiting_index)
-       ! export the cell: direction 0 for exporting
-       call send_cell(cell,0,irequestsend,xsendbuf)
-!$omp end critical
-    endif
-#endif
+!!$omp do 
 
-    call compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,rad)
 
-#ifdef MPI
-    if (do_export) then
-       ! write directly to stack
-       stack_waiting%cells(cell%waiting_index) = cell
-    else
-#endif
-       converged = .false.
-       local_its: do while (.not. converged)
-          call finish_cell(cell,converged)
-          call compute_hmax(cell,redo_neighbours)
-          if (icall == 0) converged = .true.
-          if (.not. converged) then
-             if (redo_neighbours) then
-                call set_hmaxcell(cell%icell,cell%hmax)
-                call get_neighbour_list(-1,listneigh,nneigh,xyzh,xyzcache,isizecellcache,getj=.false., &
-                                      cell_xpos=cell%xpos,cell_xsizei=cell%xsizei,cell_rcuti=cell%rcuti, &
-                                      remote_export=remote_export)
-#ifdef MPI
-                cell%remote_export(1:nprocs) = remote_export
-                if (any(remote_export)) then
-                   do_export = .true.
-!$omp critical
-                   if (stack_waiting%n > 0) call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
-                   call reserve_stack(stack_waiting,cell%waiting_index)
-                   ! direction export (0)
-                   call send_cell(cell,0,irequestsend,xsendbuf)
-!$omp end critical
-                endif
-#endif
-                nrelink = nrelink + 1
-             endif
-             call compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,rad)
-#ifdef MPI
-             if (do_export) then
-                stack_waiting%cells(cell%waiting_index) = cell
-                exit local_its
-             endif
-#endif
-          endif
-       enddo local_its
-#ifdef MPI
-       if (.not. do_export) then
-#endif
-          call store_results(icall,cell,getdv,getdB,realviscosity,stressmax,xyzh,gradh,divcurlv,divcurlB,alphaind, &
-                             dvdx,vxyzu,Bxyz,dustfrac,rhomax,nneightry,nneighact,maxneightry,maxneighact,np,ncalc,&
-                             radprop)
-#ifdef MPI
-          nlocal = nlocal + 1
-       endif
-    endif
-#endif
- enddo over_leaf_nodes
-!$omp enddo
+do i=1,ncells
+      if (ifirstincell(i) > 0) then 
+            converged = .false.
 
-#ifdef MPI
-!$omp barrier
+            !print*,"celllist hmax: ", celllist(i) % hmax 
+            call finish_cell(celllist(i),converged)
+            call compute_hmax(celllist(i),redo_neighbours)
+            !print*,"celllist hmax: ", celllist(i) % hmax 
+            if (icall == 0) converged = .true.
 
-!$omp single
- if (stack_waiting%n > 0) call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
- call recv_while_wait(stack_remote,xrecvbuf,irequestrecv,irequestsend)
-!$omp end single
 
-!$omp single
- if (iverbose>=6) then
-    ntotal = real(nlocal) + real(stack_waiting%n)
-    if (ntotal > 0) then
-       write(iprint,*) id,'local ratio = ',real(nlocal)/ntotal
-    else
-       write(iprint,*) id,'local ratio = 0'
-    endif
- endif
+             if (.not. converged) then 
+                  call set_hmaxcell(celllist(i)%icell,celllist(i)%hmax)
+                  !print*, celllist(i)%hmax 
+            
+                  celllist(i)%nneigh                  = 0
+                  celllist(i)%remote_export(1:nprocs) = remote_export
+                  celllist(i)%rhosums = 0
+                 
 
- mpiits = 0
- iterations_finished = .false.
-!$omp end single
- remote_its: do while(.not. iterations_finished)
-!$omp single
-    mpiits = mpiits + 1
-    call reset_cell_counters
-!$omp end single
+            endif
 
-    igot_remote: if (stack_remote%n > 0) then
-!$omp do schedule(runtime)
-       over_remote: do i = 1,stack_remote%n
-          cell = stack_remote%cells(i)
+      endif 
 
-          ! icell is unused (-1 here)
-          call get_neighbour_list(-1,listneigh,nneigh,xyzh,xyzcache,isizecellcache,getj=.false., &
-                                  cell_xpos=cell%xpos,cell_xsizei=cell%xsizei,cell_rcuti=cell%rcuti)
+enddo 
+!!$omp end do 
 
-          call compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,&
-                            rad)
+!!$omp single 
+ call dual_traversal(celllist, icall,xyzh,vxyzu,divcurlv,divcurlB,Bevol,stressmax,&
+                           fxyzu,fext,alphaind,gradh,rad,radprop)
+!!$omp end single 
 
-          cell%remote_export(id+1) = .false.
+ !!$omp do 
+      do i=1,ncells
+            call finish_cell(celllist(i),converged)
+            call compute_hmax(celllist(i),redo_neighbours)
 
-          ! communication happened while computing contributions to remote cells
-!$omp critical
-          call recv_cells(stack_waiting,xrecvbuf,irequestrecv)
-          call check_send_finished(stack_waiting,irequestsend,irequestrecv,xrecvbuf)
-          ! direction return (1)
-          call send_cell(cell,1,irequestsend,xsendbuf)
-!$omp end critical
-       enddo over_remote
-!$omp enddo
-!$omp barrier
-!$omp single
-       ! reset remote stack
-       stack_remote%n = 0
-       ! ensure send has finished
-       call check_send_finished(stack_waiting,irequestsend,irequestrecv,xrecvbuf)
-!$omp end single
-    endif igot_remote
-!$omp barrier
-!$omp single
-    call recv_while_wait(stack_waiting,xrecvbuf,irequestrecv,irequestsend)
-    call reset_cell_counters
-!$omp end single
-    iam_waiting: if (stack_waiting%n > 0) then
-!$omp do schedule(runtime)
-       over_waiting: do i = 1, stack_waiting%n
-          cell = stack_waiting%cells(i)
+            call store_results(icall,celllist(i),getdv,getdB,realviscosity,stressmax,xyzh,gradh,divcurlv,divcurlB,alphaind, &
+                               dvdx,vxyzu,Bxyz,dustfrac,rhomax,nneightry,nneighact,maxneightry,maxneighact,np,ncalc,&
+                               radprop)
+      enddo 
+ !!$omp end do 
+! do i=1,ncells
+! !print*,"I is: ", i
+! if (i==65550) cycle 
+! if (ifirstincell(i) > 0) then 
 
-          if (any(cell%remote_export(1:nprocs))) then
-             print*,id,cell%remote_export(1:nprocs)
-             print*,id,'mpiits',mpiits
-             print*,id,'owner',cell%owner
-             print*,id,'icell',cell%icell
-             print*,id,'npcell',cell%npcell
-             print*,id,'xpos',cell%xpos
-             print*,id,'stackpos',i
-             print*,id,'waitindex',cell%waiting_index
-             call fatal('dens', 'not all results returned from remote processor')
-          endif
 
-          call finish_cell(cell,converged)
-          call compute_hmax(cell,redo_neighbours)
+! !print*, "leaf node: ", i
+! converged = .false. 
+! !if (.not. converged) print*,i
+! !do while (.not. converged)
+!       !call = 1
+!       print*,i
 
-          ! communication happened while finishing cell
-!$omp critical
-          call recv_cells(stack_remote,xrecvbuf,irequestrecv)
-!$omp end critical
-          if (.not. converged) then
-             call set_hmaxcell(cell%icell,cell%hmax)
-             call get_neighbour_list(-1,listneigh,nneigh,xyzh,xyzcache,isizecellcache,getj=.false., &
-                                    cell_xpos=cell%xpos,cell_xsizei=cell%xsizei,cell_rcuti=cell%rcuti, &
-                                    remote_export=remote_export)
-             cell%remote_export(1:nprocs) = remote_export
-!$omp critical
-             call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
-             call reserve_stack(stack_redo,cell%waiting_index)
-             ! direction export (0)
-             call send_cell(cell,0,irequestsend,xsendbuf)
-!$omp end critical
-             call compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,&
-             rad)
+!       print*,"celllist hmax: ", celllist(i) % hmax 
+!       call finish_cell(celllist(i),converged)
+!       call compute_hmax(celllist(i),redo_neighbours)
+!       print*,"celllist hmax: ", celllist(i) % hmax 
+!       if (icall == 0) converged = .true.
+!       print*, converged
+!       print*, redo_neighbours
+!       !stop 
+      
+!       if (.not. converged) then 
+!            call set_hmaxcell(celllist(i)%icell,celllist(i)%hmax)
+!            print*, celllist(i)%hmax 
+!            stop 
+!             celllist(i)%nneigh                  = 0
+!             celllist(i)%remote_export(1:nprocs) = remote_export
+!             celllist(i)%rhosums = 0
+!             call dual_traversal(celllist, icall,xyzh,vxyzu,divcurlv,divcurlB,Bevol,stressmax,&
+!                            fxyzu,fext,alphaind,gradh,rad,radprop)
+!       !      !i = 1
+!       endif
+! !     z print*," Not converged: ", i
+!       !stop 
+! !enddo 
+! call store_results(icall,celllist(i),getdv,getdB,realviscosity,stressmax,xyzh,gradh,divcurlv,divcurlB,alphaind, &
+!                                dvdx,vxyzu,Bxyz,dustfrac,rhomax,nneightry,nneighact,maxneightry,maxneighact,np,ncalc,&
+!                                radprop)
+! endif 
+! enddo 
 
-             stack_redo%cells(cell%waiting_index) = cell
-          else
-             call store_results(icall,cell,getdv,getdB,realviscosity,stressmax,xyzh,gradh,divcurlv,divcurlB,alphaind, &
-                                dvdx,vxyzu,Bxyz,dustfrac,rhomax,nneightry,nneighact,maxneightry,maxneighact,np,ncalc,&
-                                radprop)
+!  !$omp end do 
 
-          endif
+!!$omp end parallel 
 
-       enddo over_waiting
-!$omp enddo
-!$omp barrier
-!$omp single
-       ! reset stacks
-       stack_waiting%n = 0
-       call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
-!$omp end single
-    endif iam_waiting
-!$omp barrier
-!$omp single
-    call recv_while_wait(stack_remote,xrecvbuf,irequestrecv,irequestsend)
-!$omp end single
 
-!$omp single
-    if (reduceall_mpi('max',stack_redo%n) > 0) then
-       call swap_stacks(stack_waiting, stack_redo)
-    else
-       iterations_finished = .true.
-    endif
-    stack_redo%n = 0
-!$omp end single
+!deallocate(celllist)
 
- enddo remote_its
-
-#endif
-!$omp end parallel
-
- !call update_hmax_remote
-
-#ifdef MPI
- call finish_cell_exchange(irequestrecv,xsendbuf)
- call sync_hmax_mpi
-#endif
-
- !--reduce values
- if (realviscosity .and. maxdvdx==maxp) then
-    stressmax = reduceall_mpi('max',stressmax)
- endif
- rhomax    = reduceall_mpi('max',rhomax)
- rhomaxnow = rhomax
-
- !--boundary particles are no longer treated as active
- set_boundaries_to_active = .false.
-
- if (realviscosity .and. maxdvdx==maxp .and. stressmax > 0. .and. iverbose > 0 .and. id==master) then
-    call warning('force','applying negative stress correction',var='max',val=-stressmax)
- endif
-!
-!--warnings
-!
- if (icall==1) then
-    if (nwarnup   > 0) call summary_variable('hupdn',iosumhup,0,real(nwarnup  ))
-    if (nwarndown > 0) call summary_variable('hupdn',iosumhdn,0,real(nwarndown))
-    if (iverbose  >=1) call reduce_and_print_warnings(nwarnup,nwarndown,nwarnroundoff)
- endif
-!
-!--diagnostics
-!
- if (icall==0 .or. icall==1) call reduce_and_print_neighbour_stats(np)
 
 end subroutine densityiterate
+
+
+subroutine dual_traversal(celllist, icall,xyzh,vxyzu,divcurlv,divcurlB,Bevol,stressmax,&
+                           fxyzu,fext,alphaind,gradh,rad,radprop)
+use omp_lib
+ use dim,       only:maxp,maxneigh,ndivcurlv,ndivcurlB,maxvxyzu,maxalpha, &
+                     mhd_nonideal,nalpha,use_dust
+ use io,        only:iprint,fatal,iverbose,id,master,real4,warning,error,nprocs
+ use linklist,  only:ifirstincell,ncells,get_neighbour_list,get_hmaxcell,get_cell_list,&
+                     get_cell_location,set_hmaxcell,sync_hmax_mpi,update_hmax_remote,node_is_active, node 
+ use part,      only:mhd,rhoh,dhdrho,rhoanddhdrho,&
+                     ll,get_partinfo,iactive,&
+                     hrho,iphase,igas,idust,iamgas,periodic,&
+                     all_active,dustfrac,Bxyz,set_boundaries_to_active
+ use viscosity, only:irealvisc
+ type(celldens), intent(inout) ::  celllist(:)
+ integer,      intent(in)    :: icall
+ real,         intent(inout) :: xyzh(:,:)
+ real,         intent(in)    :: vxyzu(:,:),fxyzu(:,:),fext(:,:)
+ real,         intent(in)    :: Bevol(:,:)
+ real(kind=4), intent(out)   :: divcurlv(:,:)
+ real(kind=4), intent(out)   :: divcurlB(:,:)
+ real(kind=4), intent(out)   :: alphaind(:,:)
+ real(kind=4), intent(out)   :: gradh(:,:)
+ real,         intent(out)   :: stressmax
+ real,         intent(in)    :: rad(:,:)
+ real,         intent(inout) :: radprop(:,:)
+ 
+ integer, save :: listneigh(maxneigh)
+ real,   save :: xyzcache(3,isizecellcache)
+!$omp threadprivate(xyzcache,listneigh)
+
+ integer :: i,icell
+ integer :: nneigh,np
+ integer :: nwarnup,nwarndown,nwarnroundoff
+
+ logical :: getdv,realviscosity,getdB,converged
+ logical :: iactivei,iamgasi,iamdusti
+ integer :: iamtypei
+
+ logical :: remote_export(nprocs)
+
+ real    :: rhomax
+
+ integer                   :: npcell,istart,iend
+
+ !type(celldens)            :: celllist(size(node))
+ type(celldens)            :: cell 
+
+ logical                   :: redo_neighbours
+ type(denstreestack)       :: stack(10000)
+ type(denstreestacklocal)  :: stacklocal(10000)
+ integer                   :: top,nodeindex1, nodeindex2, leftindex, rightindex, regnodeindex, splitnodeindex, numthreads
+ integer, allocatable      :: istacklocal(:)
+ integer                   :: k 
+ logical, allocatable      :: threadworking(:)
+
+
+
+!$omp parallel default(none) shared(numthreads)
+   numthreads = omp_get_num_threads()
+!$omp end parallel
+print*, "numthreads: ",numthreads
+!numthreads = 1
+allocate(istacklocal(numthreads))
+allocate(threadworking(numthreads))
+
+
+!!$omp single 
+
+! flag for whether or not we need to calculate velocity derivatives
+ ! whilst doing the density iterations (needed for viscosity switches
+ ! and for physical viscosity)
+ !
+ realviscosity = (irealvisc > 0)
+ getdv = ((maxalpha==maxp .or. ndivcurlv >= 4) .and. icall <= 1) .or. &
+         (maxdvdx==maxp .and. (use_dust .or. realviscosity))
+ if (getdv .and. ndivcurlv < 1) call fatal('densityiterate','divv not stored but it needs to be')
+ getdB = (mhd .and. (ndivcurlB >= 4 .or. mhd_nonideal))
+
+ if ( all_active ) stressmax  = 0.   ! condition is required for independent timestepping
+
+call get_cell_list(istart,iend)
+
+ top = 1
+ stack(top) % nodeindex1 = 1
+ stack(top) % interactions(1) = 1 
+ 
+ !print*, "entered single"
+ !print*, "top is: "
+
+!print*,size(node)
+
+
+threadworking = .false. 
+
+istacklocal = 0
+!open(unit=13, file="neighbours.txt", position='append')
+
+!!$omp end single 
+!!$ call init_omp()
+!print*,"finished single" 
+!$omp parallel default(none) &
+!$omp shared(icall,istart,iend) &
+!!$omp shared(ncells) &
+!!$omp shared(ll) &
+!$omp shared(ifirstincell) &
+!$omp shared(xyzh) &
+!$omp shared(vxyzu) &
+!$omp shared(fxyzu) &
+!$omp shared(fext) &
+!$omp shared(gradh) &
+!$omp shared(iphase) &
+!$omp shared(Bevol) &
+!$omp shared(divcurlv) &
+!$omp shared(divcurlB) &
+!$omp shared(alphaind) &
+!$omp shared(dustfrac) &
+!$omp shared(Bxyz) &
+!$omp shared(dvdx) &
+!$omp shared(id) &
+!$omp shared(nprocs) &
+!$omp shared(getdB) &
+!$omp shared(getdv) &
+!$omp shared(realviscosity) &
+!$omp shared(iverbose) &
+!$omp shared(iprint) &
+!$omp shared(rad,radprop)&
+#ifdef MPI
+!$omp shared(xrecvbuf) &
+!$omp shared(xsendbuf) &
+!$omp shared(irequestrecv) &
+!$omp shared(irequestsend) &
+!$omp shared(stack_remote) &
+!$omp shared(stack_waiting) &
+!$omp shared(stack_redo) &
+!$omp shared(iterations_finished) &
+!$omp shared(mpiits) &
+!$omp reduction(+:nlocal) &
+!$omp private(do_export) &
+!$omp private(j) &
+!$omp private(k) &
+!$omp private(l) &
+!$omp private(ntotal) &
+#endif
+!$omp private(remote_export) &
+!$omp private(nneigh) &
+!$omp private(npcell) &
+!$omp private(cell) &
+!$omp private(iamgasi) &
+!$omp private(iamtypei) &
+!$omp private(iactivei) &
+!$omp private(iamdusti) &
+!$omp private(converged) &
+!$omp private(redo_neighbours) &
+!$omp reduction(+:ncalc) &
+!$omp reduction(+:np) &
+!$omp reduction(max:maxneighact) &
+!$omp reduction(max:maxneightry) &
+!$omp reduction(+:nneighact) &
+!$omp reduction(+:nneightry) &
+!$omp reduction(+:nrelink) &
+!$omp reduction(+:stressmax) &
+!$omp reduction(max:rhomax) &
+!$omp private(i,k,stacklocal,nodeindex1,nodeindex2,leftindex,rightindex,splitnodeindex,regnodeindex) &
+!$omp shared(stack,istacklocal,top,node,threadworking,ncells,celllist)
+
+
+do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
+
+     !$ k=omp_get_thread_num() + 1
+     !print*,"k is:", k
+
+    if (istacklocal(k) > 0 ) then ! pop off local stack
+        !!$omp critical 
+        !print*,"istacklocal", istacklocal(k)
+        nodeindex1 = stacklocal(istacklocal(k)) % nodeindex1
+        nodeindex2 = stacklocal(istacklocal(k)) % nodeindex2
+        !print*, "Node indexes : ", nodeindex1, nodeindex2
+
+        ! If the nodes are free then we can do work with them 
+        !if (nodes(nodeindex1) % nodefree .and. nodes(nodeindex2) % nodefree) then 
+          istacklocal(k) = istacklocal(k) - 1
+          threadworking(k) = .true.
+        !  threadworking(k) = .false.
+        !endif 
+        !!$omp critical  
+
+    else 
+      !$omp critical (stack)
+      if (top > 0) then 
+        !!$OMP TASK 
+       ! nodeindex1 = stack(top) % nodeindex1
+        !nodeindex2 = stack(top) % nodeindex2
+          ! If the nodes are free then we can do work with them 
+        !if (nodes(nodeindex1) % nodefree .and. nodes(nodeindex2) % nodefree) then 
+          !top = top - 1
+          call global_to_local(stack,stacklocal,k,istacklocal,top)
+          ! pop some work of the local stack 
+          nodeindex1 = stacklocal(istacklocal(k)) % nodeindex1
+          nodeindex2 = stacklocal(istacklocal(k)) % nodeindex2
+          !print*, "node indexes :", nodeindex1, nodeindex2
+          istacklocal(k) = istacklocal(k) - 1
+          threadworking(k) = .true.
+          !threadworking(k) = .false.
+          !nodes(nodeindex1) % nodefree  = .false.
+          !nodes(nodeindex2) % nodefree  = .false.
+      else 
+        threadworking(k) = .false.
+      endif
+      !$omp end critical (stack)
+    endif 
+
+
+  !nneigh = 0 
+  !listneigh = 0
+
+ 
+ !print*, "Node 1: ", nodeindex1, "Node 2: ", nodeindex2
+  !print*, "Top: ", top 
+  !print*, "istacklocal(k): ", istacklocal(k)
+
+if (threadworking(k)) then 
+      
+      !print*, "thread: ", k, " working."
+        ! if r^2 < rcut 
+       if(trial_neighbour(node(nodeindex1), node(nodeindex2))) then
+            !if (nodeindex2 == 131080 .and. nodeindex1 == 65550) stop 
+            ! IF both leafs 
+            if (ifirstincell(nodeindex1) > 0 .AND. ifirstincell(nodeindex2) > 0) then 
+            !      if (nodeindex1 /= nodeindex2) then 
+
+                  !!$omp critical (rhosum) 
+                  call get_neighbour_list(nodeindex1,listneigh,nneigh,xyzh,xyzcache,isizecellcache,getj=.false., &
+                              remote_export=remote_export,currentnodeindex=nodeindex1, interactnodeindex=nodeindex2)
+                                                      !print*, "nneigh: ", nneigh
+                        
+                  
+                  ! Put omp lock here 
+                  !$omp critical (rhosum)
+                  if (nneigh > 0) then 
+                  call compute_cell(celllist(nodeindex1),listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,rad)
+                  endif  
+                  !$omp end critical (rhosum)
+
+                 
+
+                  !if(nodeindex1 == 65550) then 
+                    !do k=1,nneigh
+                    !write(13,*) nodeindex2
+                  !enddo
+                  !endif 
+                  !k = 1
+                  !if identical split 
+            else if (nodeindex1 == nodeindex2) then 
+                  ! SPLIT THE IDENTICAL NODE
+
+                  leftindex = node(nodeindex1) % leftchild
+                  rightindex = node(nodeindex1) % rightchild 
+
+                 !print*,"leftindex: ", leftindex
+                  !print*,"rightindex: ", rightindex
+
+                  !$omp critical (stack)
+
+                  !if (leftindex /= 0 .and. rightindex /= 0) then 
+                        top = top + 1
+                        stack(top) % nodeindex1 = leftindex
+                        stack(top) % interactions(1) = leftindex
+                        stack(top) % interactions(2) = rightindex
+
+                        top = top + 1 
+                        stack(top) % nodeindex1 = rightindex
+                        stack(top) % interactions(1) = rightindex
+                        stack(top) % interactions(2) = leftindex
+                  !endif 
+
+                  !$omp end critical (stack)
+
+            else 
+                   ! FIND LARGER NODE 
+
+                  if (node(nodeindex1) % size > node(nodeindex2) % size) then
+                   !splitnode = nodes(nodeindex1)
+                        splitnodeindex = nodeindex1
+                        !regnode = nodes(nodeindex2)
+                        regnodeindex = nodeindex2
+                  else 
+                        !splitnode = nodes(nodeindex2)
+                        splitnodeindex = nodeindex2
+                        !regnode = nodes(nodeindex1)
+                        regnodeindex = nodeindex1
+                  endif 
+
+                  if (ifirstincell(splitnodeindex) <= 0) then 
+                        ! split larger node and push interactions to stack 
+                        leftindex = node(splitnodeindex) % leftchild
+                        rightindex = node(splitnodeindex) % rightchild
+
+                         !print*,"leftindex: ", leftindex
+                         !print*,"rightindex: ", rightindex
+
+                        ! If splitting node push to global stack 
+                        if (nodeindex1 == splitnodeindex) then 
+                              !$omp critical (stack)
+                              if (leftindex /= 0) then 
+                                    top = top + 1
+                                    stack(top) % nodeindex1 = leftindex
+                                    stack(top) % interactions(1) = regnodeindex
+                              endif 
+                              if (rightindex /= 0) then 
+                                    top = top + 1
+                                    stack(top) % nodeindex1 = rightindex
+                                    stack(top) % interactions(1) = regnodeindex
+                              endif 
+                              !$omp end critical (stack)
+
+                        else 
+                  
+                              if (leftindex /= 0) then 
+                                    istacklocal(k) = istacklocal(k) + 1
+                                    stacklocal(istacklocal(k)) % nodeindex1 = regnodeindex
+                                    stacklocal(istacklocal(k)) % nodeindex2 = leftindex
+                              endif
+
+                              if (rightindex /= 0) then 
+                                    istacklocal(k) = istacklocal(k) + 1
+                                    stacklocal(istacklocal(k)) % nodeindex1 = regnodeindex
+                                    stacklocal(istacklocal(k)) % nodeindex2 = rightindex
+                              endif 
+
+                        endif 
+
+                          !if (nodeindex2 == 131080 .and. nodeindex1 == 32775) then 
+
+                          !print*,"leftindex: ", leftindex
+                          !print*,"rightindex: ", rightindex
+                          !print*,"splitnodeindex,", splitnodeindex
+                          !print*,"regnodeindex: ", regnodeindex
+                          !endif 
+                  ! IF we have reached a leafnode we need to split the other node 
+                  else 
+                        leftindex = node(regnodeindex) % leftchild
+                        rightindex = node(regnodeindex) % rightchild
+
+                         ! If splitting node push to global stack 
+                        if (nodeindex1 == regnodeindex) then 
+                              !$omp critical (stack)
+                              if (leftindex /= 0) then 
+                                    top = top + 1
+                                    stack(top) % nodeindex1 = leftindex
+                                    stack(top) % interactions(1) = splitnodeindex
+                              endif 
+                              if (rightindex /= 0) then 
+                                    top = top + 1
+                                    stack(top) % nodeindex1 = rightindex
+                                    stack(top) % interactions(1) = splitnodeindex
+                              endif 
+                              !$omp end critical (stack)
+
+                        else 
+                  
+                              if (leftindex /= 0) then 
+                                    istacklocal(k) = istacklocal(k) + 1
+                                    stacklocal(istacklocal(k)) % nodeindex1 = splitnodeindex
+                                    stacklocal(istacklocal(k)) % nodeindex2 = leftindex
+                              endif
+
+                              if (rightindex /= 0) then 
+                                    istacklocal(k) = istacklocal(k) + 1
+                                    stacklocal(istacklocal(k)) % nodeindex1 = splitnodeindex
+                                    stacklocal(istacklocal(k)) % nodeindex2 = rightindex
+                              endif 
+
+                        endif 
+
+                  endif 
+
+
+            endif 
+
+     
+
+      endif 
+
+endif 
+
+
+
+
+
+enddo 
+!$omp end parallel
+
+end subroutine dual_traversal
+
 
 !----------------------------------------------------------------
 !+
@@ -584,7 +1331,7 @@ end subroutine densityiterate
 !  MAKE SURE THIS ROUTINE IS INLINED BY THE COMPILER
 !+
 !----------------------------------------------------------------
-pure subroutine get_density_sums(i,xpartveci,hi,hi1,hi21,iamtypei,iamgasi,iamdusti,&
+ subroutine get_density_sums(i,xpartveci,hi,hi1,hi21,iamtypei,iamgasi,iamdusti,&
                                  listneigh,nneigh,nneighi,dxcache,xyzcache,rhosum,&
                                  ifilledcellcache,ifilledneighcache,getdv,getdB,&
                                  realviscosity,xyzh,vxyzu,Bevol,fxyzu,fext,ignoreself,&
@@ -608,7 +1355,7 @@ pure subroutine get_density_sums(i,xpartveci,hi,hi1,hi21,iamtypei,iamgasi,iamdus
  integer,      intent(out)   :: nneighi
  real,         intent(inout) :: dxcache(:,:)
  real,         intent(in)    :: xyzcache(:,:)
- real,         intent(out)   :: rhosum(:)
+ real,         intent(inout)   :: rhosum(:)
  logical,      intent(in)    :: ifilledcellcache,ifilledneighcache
  logical,      intent(in)    :: getdv,realviscosity
  logical,      intent(in)    :: getdB
@@ -628,7 +1375,7 @@ pure subroutine get_density_sums(i,xpartveci,hi,hi1,hi21,iamtypei,iamgasi,iamdus
  logical                     :: same_type,gas_gas,iamdustj
  real                        :: dradenij
 
- rhosum(:) = 0.
+ !rhosum(:) = 0.
  if (ignoreself) then
     nneighi = 1   ! self
  else
@@ -682,11 +1429,20 @@ pure subroutine get_density_sums(i,xpartveci,hi,hi1,hi21,iamtypei,iamgasi,iamdus
     endif
 
     q2i = rij2*hi21
+
+    ! print*, rij2
+    ! print*,hi21
+    ! print*,q2i
+    ! print*, radkern2
+    ! print*, "dx,dy,dz"
+    ! print*, dx, dy, dz 
+    ! stop 
     !print*,i,' neighb',j,' #',n,' of ',nneigh,isizecellcache,' q2i=',dx,dy,dz,hi21
 !
 !--do interaction if r/h < compact support size
 !
     if (q2i < radkern2) then
+      !print*, "do"
        if (ifilledneighcache .and. n <= isizeneighcache) then
           q2prev = dxcache(2,n)
           if (q2prev < radkern2) then
@@ -1253,7 +2009,7 @@ end subroutine reduce_and_print_neighbour_stats
 !--------------------------------------------------------------------------
 !+
 !--------------------------------------------------------------------------
-pure subroutine compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext, &
+subroutine compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext, &
                              xyzcache,rad)
  use dim,         only:maxvxyzu
  use part,        only:get_partinfo,iamgas,mhd,igas,maxphase
@@ -1427,6 +2183,8 @@ subroutine start_cell(cell,iphase,xyzh,vxyzu,fxyzu,fext,Bevol,rad)
     endif
 
     if (do_radiation) cell%xpartvec(iradxii,cell%npcell) = rad(iradxi,i)
+    !print*,"Cell h: ", cell % h
+    !stop 
 
  enddo over_parts
 
@@ -1644,6 +2402,11 @@ subroutine store_results(icall,cell,getdv,getdb,realviscosity,stressmax,xyzh,&
 
     call finish_rhosum(rhosum,pmassi,hi,.false.,rhoi=rhoi,gradhi=gradhi,gradsofti=gradsofti)
 
+    !print*, "rho i", rhoi
+
+    !if (rhosum(1,i) > 0) then 
+    ! print*, "rhosum", rhosum
+    !endif 
     !
     !--store final results of density iteration
     !
@@ -1781,5 +2544,289 @@ subroutine store_results(icall,cell,getdv,getdb,realviscosity,stressmax,xyzh,&
  ncalc = ncalc + cell%nits
 
 end subroutine store_results
+
+logical function well_separated(node1,node2) result(bool)
+  use dtypekdtree, only:kdnode
+  type(kdnode), intent(in) :: node1, node2
+  real :: cm1(3), cm2(3), dx(3), zmag
+  real :: theta,rmax1,rmax2
+  !logical :: bool
+
+  !bool =.true.
+  !return 
+  theta = 0.1
+
+  cm1 = node1 % xcen
+  cm2 = node2 % xcen 
+
+  ! Get the magnitude of the difference between CoM's
+  dx = cm1 - cm2
+  !print*,dx
+  zmag = sqrt(dx(1)*dx(1) + dx(2)*dx(2)+ dx(3)*dx(3))
+
+  ! get the rmax for nodes 1 and 2
+  rmax1 = node1 % size
+  rmax2 = node2 % size
+  !call distance_to_corner(node1,rmax1)
+  !call distance_to_corner(node2,rmax2)
+
+
+  !print*, "Rmax values: "
+  !print*, rmax1, rmax2
+
+  !print*,"Zmag: ", zmag
+  !print*, "rmax1 + rmax2/theta: ", (rmax1 + rmax2)/theta
+  if (zmag > (rmax1+rmax2)/theta) then
+    bool = .TRUE.
+  else 
+    bool = .FALSE.
+  endif  
+ end function well_separated
+
+ logical function trial_neighbour(node1,node2)
+#ifdef PERIODIC
+  use boundary, only:dxbound,dybound,dzbound
+#endif 
+  use dtypekdtree, only:kdnode
+  use kernel, only:radkern
+  type(kdnode), intent(in) :: node1, node2
+  real :: dx, dy, dz
+  real :: xsizej,xsizei,hmaxj,hmaxi,rcuti,rcutj,rcut,rcut2,r2 
+  real :: xoffset,yoffset,zoffset
+  real :: dr,r(3) 
+  
+
+  ! PERIODIC STUFF 
+#ifdef PERIODIC
+  real :: hdlx,hdly,hdlz
+  !print*, "periodic"
+  hdlx = 0.5*dxbound
+  hdly = 0.5*dybound
+  hdlz = 0.5*dzbound
+  !print*, "periodic"
+#endif
+
+  dx     = node1%xcen(1) - node2%xcen(1)      ! distance between node centres
+  dy     = node1%xcen(2) - node2%xcen(2)
+  dz     = node1%xcen(3) - node2%xcen(3)
+
+  !call get_child_nodes(n,il,ir)
+  xoffset = 0.
+  yoffset = 0.
+  zoffset = 0.
+#ifdef PERIODIC
+    if (abs(dx) > hdlx) then            ! mod distances across boundary if periodic BCs
+       xoffset = dxbound*SIGN(1.0,dx)
+       dx = dx - xoffset
+    endif
+    if (abs(dy) > hdly) then
+       yoffset = dybound*SIGN(1.0,dy)
+       dy = dy - yoffset
+    endif
+    if (abs(dz) > hdlz) then
+       zoffset = dzbound*SIGN(1.0,dz)
+       dz = dz - zoffset
+    endif
+#endif
+   r = (/dx,dy,dz/)
+   ! find vector mag 
+  dr = norm2(r)
+  xsizej = node2%size
+  hmaxj  = node2%hmax
+  xsizei = node1%size
+  hmaxi  = node1%hmax
+  rcuti  = radkern*hmaxi
+  !rcuti = node1%rcuti
+  rcutj  = radkern*hmaxj
+  rcut   = max(rcuti,rcutj)
+  !rcut = rcuti
+
+  rcut2  = (xsizei + xsizej + rcut)**2
+  !r2     = dx*dx + dy*dy + dz*dz 
+  ! add node size 
+  dr = dr ! - xsizei - xsizej
+  r2 = dr*dr
+
+  !print*, (xsizei + xsizej + rcut)
+  !print*, dx,dy,dz 
+  trial_neighbour = r2 < rcut2
+
+
+
+ end function trial_neighbour
+
+real function get_r2(node1, node2)
+#ifdef PERIODIC
+  use boundary, only:dxbound,dybound,dzbound
+#endif 
+  use dtypekdtree, only:kdnode
+  use kernel, only:radkern
+  type(kdnode), intent(in) :: node1, node2
+  real :: dx, dy, dz
+  real :: xsizej,xsizei,hmaxj,hmaxi,rcuti,rcutj,rcut,rcut2,r2 
+  real :: xoffset,yoffset,zoffset
+  real :: dr, r(3)
+
+
+  ! PERIODIC STUFF 
+#ifdef PERIODIC
+  real :: hdlx,hdly,hdlz
+
+  hdlx = 0.5*dxbound
+  hdly = 0.5*dybound
+  hdlz = 0.5*dzbound
+  !print*, "periodic"
+#endif
+
+  dx     = node1%xcen(1) - node2%xcen(1)      ! distance between node centres
+  dy     = node1%xcen(2) - node2%xcen(2)
+  dz     = node1%xcen(3) - node2%xcen(3)
+
+  !call get_child_nodes(n,il,ir)
+  xoffset = 0.
+  yoffset = 0.
+  zoffset = 0.
+#ifdef PERIODIC
+    if (abs(dx) > hdlx) then            ! mod distances across boundary if periodic BCs
+       xoffset = dxbound*SIGN(1.0,dx)
+       dx = dx - xoffset
+    endif
+    if (abs(dy) > hdly) then
+       yoffset = dybound*SIGN(1.0,dy)
+       dy = dy - yoffset
+    endif
+    if (abs(dz) > hdlz) then
+       zoffset = dzbound*SIGN(1.0,dz)
+       dz = dz - zoffset
+    endif
+#endif
+  
+   r = (/dx,dy,dz/)
+   ! find vector mag 
+  dr = norm2(r)
+  ! add node size 
+  
+  xsizej = node2%size
+  hmaxj  = node2%hmax
+  xsizei = node1%size
+  hmaxi  = node1%hmax
+  rcuti  = radkern*hmaxi
+  !rcuti = node1%rcuti
+  rcutj  = radkern*hmaxj
+  !rcut   = max(rcuti,rcutj)
+  rcut = rcuti
+  rcut2  = (xsizei + xsizej+ rcut)**2
+  dr = dr  - xsizei - xsizej
+  !r2     = dx*dx + dy*dy + dz*dz
+  r2 = dr*dr 
+
+  get_r2 = r2 
+
+ end function get_r2
+
+real function get_rcut2(node1,node2)
+#ifdef PERIODIC
+  use boundary, only:dxbound,dybound,dzbound
+#endif 
+  use dtypekdtree, only:kdnode
+  use kernel, only:radkern
+  type(kdnode), intent(in) :: node1, node2
+  real :: dx, dy, dz
+  real :: xsizej,xsizei,hmaxj,hmaxi,rcuti,rcutj,rcut,rcut2,r2 
+  real :: xoffset,yoffset,zoffset
+
+
+  ! PERIODIC STUFF 
+#ifdef PERIODIC
+  real :: hdlx,hdly,hdlz
+
+  hdlx = 0.5*dxbound
+  hdly = 0.5*dybound
+  hdlz = 0.5*dzbound
+  !print*, "periodic"
+#endif
+
+  dx     = node1%xcen(1) - node2%xcen(1)      ! distance between node centres
+  dy     = node1%xcen(2) - node2%xcen(2)
+  dz     = node1%xcen(3) - node2%xcen(3)
+
+  !call get_child_nodes(n,il,ir)
+  xoffset = 0.
+  yoffset = 0.
+  zoffset = 0.
+#ifdef PERIODIC
+    if (abs(dx) > hdlx) then
+        print*, "periodic"            ! mod distances across boundary if periodic BCs
+       xoffset = dxbound*SIGN(1.0,dx)
+       dx = dx - xoffset
+    endif
+    if (abs(dy) > hdly) then
+      print*, "periodic"
+       yoffset = dybound*SIGN(1.0,dy)
+       dy = dy - yoffset
+    endif
+    if (abs(dz) > hdlz) then
+      print*, "periodic"
+       zoffset = dzbound*SIGN(1.0,dz)
+       dz = dz - zoffset
+    endif
+#endif
+  xsizej = node2%size
+  hmaxj  = node2%hmax
+  xsizei = node1%size
+  hmaxi  = node1%hmax
+  rcuti  = radkern*hmaxi
+  !rcuti = node1%rcuti
+  rcutj  = radkern*hmaxj
+  !rcut   = max(rcuti,rcutj)
+  rcut = rcuti
+  rcut2  = (xsizei + xsizej + rcut)**2
+  !print*,"rcut: ", (xsizei + xsizej + rcut)
+  !print*, "r: ", dx,dy,dz
+  r2     = dx*dx + dy*dy + dz*dz
+
+  get_rcut2 = rcut2
+
+ end function get_rcut2
+
+
+
+ subroutine global_to_local(stack,stacklocal,threadnumber,istacklocal,top)
+  type(denstreestack), intent(inout) :: stack(:)
+  type(denstreestacklocal), intent(inout) :: stacklocal(:)
+  integer, intent(in) :: threadnumber
+  integer, intent(inout) :: istacklocal(:),top 
+  integer :: theinteractions(2), thenode,i 
+
+  ! POP FROM GLOBAL AND PUSH TO LOCAL STACK 
+
+  thenode = 0 
+  theinteractions = 0
+
+  ! POP FROM GLOBAL
+  !!$omp critical (stack)
+  thenode = stack(top) % nodeindex1
+  theinteractions =  stack(top) % interactions
+  ! cleanup interactions
+  stack(top) % interactions = 0
+  top = top - 1 
+  !!$omp end critical (stack)
+
+  do i=1,2
+      if (theinteractions(i) /= 0) then 
+      !print*,"i is: ", i
+            istacklocal(threadnumber) = istacklocal(threadnumber) + 1
+            stacklocal(istacklocal(threadnumber)) % nodeindex1 = thenode
+            stacklocal(istacklocal(threadnumber)) % nodeindex2 = theinteractions(i)
+      endif 
+
+
+
+  enddo 
+
+
+
+ end subroutine global_to_local
+
 
 end module densityforce
