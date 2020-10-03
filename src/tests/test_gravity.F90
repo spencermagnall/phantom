@@ -59,6 +59,7 @@ subroutine test_gravity(ntests,npass,string)
  real :: fnode(20)
  real :: quads(6)
  real :: dr,phiexact,phi,dr2,pmassi,epoti,tol,tree_acc_prev
+ real :: p(3),pmag
 
  if (id==master) write(*,"(/,a,/)") '--> TESTING SELF-GRAVITY'
 
@@ -248,10 +249,10 @@ subroutine test_gravity(ntests,npass,string)
           nx       = int(np**(1./3.))
           psep     = totvol**(1./3.)/real(nx)
           !print*,' got psep = ',nx,psep
-          psep     = 0.18
+          !psep     = 0.18
           npart    = 0
           call set_sphere('cubic',id,master,rmin,rmax,psep,hfact,npart,xyzh)
-          !print*,' using npart = ',npart
+          print*,' using npart = ',npart
           np       = npart
           !iverbose = 5
 !
@@ -301,6 +302,13 @@ subroutine test_gravity(ntests,npass,string)
           do i=1,npart
              epoti = epoti + poten(i)
           enddo
+          ! check linear momentum here
+          p = 0. 
+          do i=1,npart
+            p = p + fxyzu(:,i)*massoftype(k)
+          enddo 
+          pmag = norm2(p)
+          print*, "Momentum is: ", pmag
           call checkval(epoti,phitot,5.1e-4,nfailed(4),'potential')
           call checkval(epoti,-3./5.*totmass**2/rmax,3.6e-2,nfailed(5),'potential=-3/5 GMM/R')
           ! check that potential energy computed via compute_energies is also correct

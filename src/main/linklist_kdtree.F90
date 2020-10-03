@@ -47,6 +47,7 @@ module linklist
  public :: set_hmaxcell,get_hmaxcell,update_hmax_remote
  public :: get_cell_location
  public :: sync_hmax_mpi
+ public :: get_long_range
 
  private
 
@@ -155,7 +156,7 @@ end subroutine get_distance_from_centre_of_mass
 
 subroutine set_linklist(npart,nactive,xyzh,vxyzu)
  use dtypekdtree,  only:ndimtree
- use kdtree,       only:maketree
+ use kdtree,       only:maketree,revtree,get_nodesize_max
 #ifdef MPI
  use kdtree,       only: maketreeglobal
 #endif
@@ -173,6 +174,9 @@ subroutine set_linklist(npart,nactive,xyzh,vxyzu)
  call maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,npart,ndimtree,cellatid,ifirstincell,ncells)
 #else
  call maketree(node,xyzh,npart,ndimtree,ifirstincell,ncells)
+ ! Call revtree to get max size 
+ !call revtree(node, xyzh, ifirstincell, ncells)
+ call get_nodesize_max(node, xyzh, ifirstincell, ncells)
 #endif
 
 end subroutine set_linklist
@@ -187,7 +191,7 @@ end subroutine set_linklist
 !-----------------------------------------------------------------------
 subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesize, &
                               getj,f,remote_export, &
-                              cell_xpos,cell_xsizei,cell_rcuti,local_gravity)
+                              cell_xpos,cell_xsizei,cell_rcuti,local_gravity,neighbours_found)
  use kdtree, only:getneigh,lenfgrav
  use kernel, only:radkern
 #ifdef PERIODIC
@@ -204,6 +208,7 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
  logical, intent(out), optional :: remote_export(:)
  real,    intent(in),  optional :: cell_xpos(3),cell_xsizei,cell_rcuti
  logical, intent(in),  optional :: local_gravity
+ integer, intent(out), optional :: neighbours_found
  real :: xpos(3)
  real :: fgrav(lenfgrav),fgrav_global(lenfgrav)
  real :: xsizei,rcuti
@@ -242,8 +247,14 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
                 cellatid,get_j,fgrav_global,remote_export=remote_export)
     endif
 #endif
+    if (present(neighbours_found)) then 
     call getneigh(node,xpos,xsizei,rcuti,3,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesize,&
+              ifirstincell,get_j,fgrav,neighbours_found=neighbours_found)
+    else 
+      call getneigh(node,xpos,xsizei,rcuti,3,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesize,&
               ifirstincell,get_j,fgrav)
+    endif 
+
     if (present(local_gravity)) then
        f = fgrav
     else
@@ -257,8 +268,14 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
               cellatid,get_j,remote_export=remote_export)
     endif
 #endif
-    call getneigh(node,xpos,xsizei,rcuti,3,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesize,&
+    if (present(neighbours_found)) then 
+      call getneigh(node,xpos,xsizei,rcuti,3,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesize,&
+               ifirstincell,get_j,neighbours_found=neighbours_found)
+    else 
+
+      call getneigh(node,xpos,xsizei,rcuti,3,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesize,&
                ifirstincell,get_j)
+    endif 
  endif
 
 end subroutine get_neighbour_list
@@ -278,6 +295,24 @@ subroutine getneigh_pos(xpos,xsizei,rcuti,ndim,mylistneigh,nneigh,xyzh,xyzcache,
                ifirstincell,.false.)
 
 end subroutine getneigh_pos
+
+subroutine get_long_range(xyzh,fxyzu_dtt,poten_dtt,nonodesfound)
+  use kdtree, only: evaluate, interact,revtree 
+  real, intent(in) :: xyzh(:,:)
+  real, intent(inout) :: fxyzu_dtt(:,:), poten_dtt(:)
+  integer, optional, intent(out) :: nonodesfound(:)
+  
+
+
+  ! Get long range coefficients
+  call interact(node,ifirstincell,xyzh,fxyzu_dtt,poten_dtt,nonodesfound)
+  ! Pass down tree 
+
+  ! THIS IS THE MEM ALLOCATE BUG 
+  call evaluate(node, ifirstincell)
+  print*, "evaluate finished"
+
+end subroutine get_long_range
 
 !-----------------------------------------------------------------------
 !+

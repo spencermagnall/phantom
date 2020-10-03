@@ -159,9 +159,9 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
                  rad,drad,radprop,dustprop,dustgasprop,dustfrac,ddustevol,&
                  ipart_rhomax,dt,stressmax,eos_vars,dens,metrics)
 
- use dim,          only:maxvxyzu,maxneigh,mhd,mhd_nonideal,lightcurve
+ use dim,          only:maxvxyzu,maxan,maxneigh,mhd,mhd_nonideal,lightcurve
  use io,           only:iprint,fatal,iverbose,id,master,real4,warning,error,nprocs
- use linklist,     only:ncells,get_neighbour_list,get_hmaxcell,get_cell_location,listneigh
+ use linklist,     only:ncells,get_neighbour_list,get_hmaxcell,get_cell_location,listneigh,node
  use options,      only:iresistive_heating
  use part,         only:rhoh,dhdrho,rhoanddhdrho,alphaind,iactive,gradh,&
                         hrho,iphase,igas,maxgradh,dvdx,eta_nimhd,deltav,poten,iamtype
@@ -184,9 +184,9 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  use part,         only:divBsymm,isdead_or_accreted,h2chemistry,ngradh,gravity,ibin_wake
  use mpiutils,     only:reduce_mpi,reduceall_mpi,reduceloc_mpi,bcast_mpi
 #ifdef GRAVITY
- use kernel,       only:kernel_softening
+ use kernel,       only:kernel_softening,radkern
  use kdtree,       only:expand_fgrav_in_taylor_series
- use linklist,     only:get_distance_from_centre_of_mass
+ use linklist,     only:get_distance_from_centre_of_mass, get_long_range
  use part,         only:xyzmh_ptmass,nptmass,massoftype,maxphase,is_accretable
  use ptmass,       only:icreate_sinks,rho_crit,r_crit2
  use units,        only:unit_density
@@ -224,6 +224,14 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  real,         intent(out)   :: drad(:,:)
  real,         intent(inout) :: radprop(:,:)
  real,         intent(in)    :: dens(:), metrics(:,:,:,:)
+
+#ifdef GRAVITY
+ real, allocatable           :: fxyzu_dtt(:,:),poten_dtt(:)
+ integer, allocatable        :: nonodesfound(:)
+#endif 
+ integer                     :: noleaf,leafnodeindex 
+ integer                     :: neighbours_tree, neighbours_actual,neighbours_found
+ real                        :: rcuti,rcutj,rcut2,rcut,r2,xsizei,xsizej 
 
  real, save :: xyzcache(maxcellcache,4)
 !$omp threadprivate(xyzcache)
@@ -349,7 +357,90 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  call reset_cell_counters
 #endif
 
-!
+! ! Check neighbour finding for O(N^2) case
+! ! Probably should have own routine 
+!  neighbours_actual = 0
+! do i=1, int(ncells)
+!   ! index for leaf node 
+!   if (ifirstincell(i) <= 0) cycle 
+!   leafnodeindex = leafnodeindex + 1  
+!     do j=1, int(ncells)
+!       if (ifirstincell(j) /= 0) then 
+!         dx = node(i) % xcen(1) - node(j) % xcen(1)
+!         dy = node(i) % xcen(2) - node(j) % xcen(2)
+!         dz = node(i) % xcen(3) - node(j) % xcen(3)
+!         r2    = dx*dx + dy*dy + dz*dz
+!         xsizei = node(i) % size
+!         xsizej = node(j) % size 
+!         rcuti = node(i)%hmax * radkern 
+!         rcutj = node(j)%hmax * radkern 
+!         rcut = max(rcuti,rcutj)
+!         rcut2 = (xsizei + xsizej + rcut)**2
+
+!         if (r2 < rcut2) then 
+!           neighbours_actual = neighbours_actual + 1
+!         endif 
+!       endif 
+!     enddo 
+! enddo 
+! !print*, "neighbours_actual: ", neighbours_actual
+! ! Check for neighbours from tree 
+! neighbours_tree = 0
+! neighbours_found = 0
+! do icell=1, int(ncells)
+!   if (ifirstincell(icell) <= 0) cycle 
+!     cell%icell = icell
+
+!     call start_cell(cell,iphase,xyzh,vxyzu,gradh,divcurlv,divcurlB,dvdx,Bevol, &
+!                     dustfrac,dustprop,eta_nimhd,eos_vars,alphaind,stressmax,&
+!                     rad,radprop,dens,metrics)
+!     if (cell%npcell == 0) cycle
+
+!     call get_cell_location(icell,cell%xpos,cell%xsizei,cell%rcuti)
+!     !
+!     !--get the neighbour list and fill the cell cache
+!     call get_neighbour_list(icell,listneigh,nneigh,xyzh,xyzcache,maxcellcache,getj=.true., &
+! #ifdef GRAVITY
+!                            f=cell%fgrav, &
+! #endif
+!                            remote_export=remote_export,neighbours_found=neighbours_found)
+!     neighbours_tree = neighbours_tree + neighbours_found
+!     !print*, "neighbours_tree: ", neighbours_tree
+
+! enddo 
+
+! print*, "tree neighbours: ", neighbours_tree, "Actual neighbours: ", neighbours_actual
+! print*, "Missing neighbours: ", (1. - real(neighbours_tree)/real(neighbours_actual))*100.,"%"
+! !stop 
+
+! Allocate force array for dtt 
+#ifdef GRAVITY 
+
+allocate(fxyzu_dtt(maxvxyzu, maxan))
+allocate(poten_dtt(maxan))
+allocate(nonodesfound(maxan))
+fxyzu_dtt = 0.
+poten_dtt = 0.
+nonodesfound = 0 
+
+do i=1, int(ncells)
+  node(i) % fnode = 0.
+enddo  
+
+
+call get_long_range(xyzh,fxyzu_dtt,poten_dtt,nonodesfound)
+#endif 
+
+noleaf = 0 
+do i=1, int(ncells)
+  if (ifirstincell(i) > 0) then
+    !print*, i
+    !stop 
+    noleaf = noleaf + 1 
+  endif 
+enddo 
+!print*, "number of leaf nodes: ", noleaf
+!stop 
 !-- verification for non-ideal MHD
  if (mhd_nonideal .and. ndivcurlB < 4) call fatal('force','non-ideal MHD needs curl B stored, but ndivcurlB < 4')
 !
@@ -365,6 +456,8 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 !$omp shared(dustgasprop) &
 !$omp shared(vxyzu) &
 !$omp shared(fxyzu) &
+!$omp shared(node) & 
+!!$omp shared(fxyzu_dtt) &
 !$omp shared(divcurlv) &
 !$omp shared(iphase) &
 !$omp shared(dvdx) &
@@ -423,7 +516,8 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 !$omp shared(dustfrac) &
 !$omp shared(ddustevol) &
 !$omp shared(deltav) &
-!$omp shared(ibin_wake,ibinnow_m1)
+!$omp shared(ibin_wake,ibinnow_m1) & 
+!$omp shared(nonodesfound,neighbours_found)
 
 !$omp do schedule(runtime)
  over_cells: do icell=1,int(ncells)
@@ -431,7 +525,8 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 
     !--skip empty cells AND inactive cells
     if (i <= 0) cycle over_cells
-
+    !print*, icell
+    !stop 
     cell%icell = icell
 
     call start_cell(cell,iphase,xyzh,vxyzu,gradh,divcurlv,divcurlB,dvdx,Bevol, &
@@ -442,13 +537,26 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
     call get_cell_location(icell,cell%xpos,cell%xsizei,cell%rcuti)
     !
     !--get the neighbour list and fill the cell cache
-    !
-
-    call get_neighbour_list(icell,listneigh,nneigh,xyzh,xyzcache,maxcellcache,getj=.true., &
+    !if (icell==285) then 
+      !print*, cell % hmax 
+      !stop 
+      !print*,"icell: ", icell
+     call get_neighbour_list(icell,listneigh,nneigh,xyzh,xyzcache,maxcellcache,getj=.true., &
 #ifdef GRAVITY
                            f=cell%fgrav, &
 #endif
-                           remote_export=remote_export)
+                           remote_export=remote_export,neighbours_found=neighbours_found)
+      cell % fgrav = node(icell) % fnode
+    !print*, "total number of interactions on leaf: ", nonodesfound(icell) + neighbours_found
+    !endif 
+#ifdef GRAVITY
+    
+    !if (any(listneigh == 94)) then 
+    ! print*, "94 node index is: ", icell
+    ! stop 
+    !endif 
+    !if (isnan(node(icell)%fnode(1))) stop "node nan"
+#endif 
 #ifdef MPI
     cell%owner                   = id
     cell%remote_export(1:nprocs) = remote_export
@@ -645,6 +753,28 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  endif
 #endif
 !$omp end parallel
+
+#ifdef GRAVITY
+ 
+!ADD LONG RANGE CONTRIBUTION 
+!iamtypei = igas  
+do i=1, npart 
+  if (maxphase==maxp) then
+          iamtypei = iamtype(iphase(i))
+  endif
+  fxyzu(1,i) = fxyzu(1,i) + fxyzu_dtt(1,i)
+  !if (isnan(fxyzu(1,i)))  stop "nan" 
+  fxyzu(2,i) = fxyzu(2,i) + fxyzu_dtt(2,i)
+  fxyzu(3,i) = fxyzu(3,i) + fxyzu_dtt(3,i)
+  pmassi = massoftype(iamtypei)
+  poten(i) =  poten(i) + 0.5*(poten_dtt(i)*pmassi)
+  !if (isnan(poten(i))) stop 
+
+enddo 
+
+deallocate(poten_dtt)
+deallocate(fxyzu_dtt)
+#endif
 
 #ifdef IND_TIMESTEPS
  ! check for nbinmaxnew = 0, can happen if all particles

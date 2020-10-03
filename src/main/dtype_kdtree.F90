@@ -32,8 +32,10 @@ module dtypekdtree
                     + 4 &           ! rightchild
                     + 4 &           ! parent
 #ifdef GRAVITY
+                    + 8 &           ! maxsize 
                     + 8 &           ! mass
                     + 8*6 &         ! quads(6)
+                    + 8*20 &        ! fnode(20)
 #endif
 #ifdef TREEVIZ
  + 8*ndimtree &  ! xmin(ndimtree)
@@ -57,8 +59,10 @@ module dtypekdtree
     integer :: rightchild
     integer :: parent
 #ifdef GRAVITY
+    real :: maxsize
     real :: mass
     real :: quads(6)
+    real :: fnode(20)
 #endif
 #ifdef TREEVIZ
     real :: xmin(ndimtree)

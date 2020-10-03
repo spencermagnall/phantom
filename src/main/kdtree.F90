@@ -50,12 +50,12 @@ module kdtree
  integer, private :: numthreads
 
  public :: allocate_kdtree, deallocate_kdtree
- public :: maketree, revtree, getneigh, kdnode
+ public :: maketree, revtree, getneigh, kdnode,get_nodesize_max
 #ifdef MPI
  public :: maketreeglobal
 #endif
  public :: empty_tree
- public :: compute_fnode, expand_fgrav_in_taylor_series
+ public :: compute_fnode, expand_fgrav_in_taylor_series,evaluate,interact
 
  integer, parameter, public :: lenfgrav = 20
 
@@ -69,6 +69,24 @@ module kdtree
     real    :: xmin(ndimtree)
     real    :: xmax(ndimtree)
  end type
+
+
+ type denstreestacklocal
+  integer :: nodeindex1 =0, nodeindex2 = 0 
+ end type 
+
+ type denstreestack
+  integer :: nodeindex1 = 0 
+  integer :: interactions(2) = 0
+ end type 
+
+ type evaluate_stack_data
+
+ integer :: nodeindex = 0
+ real :: fnode(lenfgrav) = 0
+ real :: z0(3) = 0
+
+ end type 
 
  private
 
@@ -590,7 +608,7 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
        yi = xyzh_soa(i,2)
        zi = xyzh_soa(i,3)
        hi = xyzh_soa(i,4)
-       hmax  = max(hmax,hi)
+       hmax  = max(hmax,hi)  
        if (maxphase==maxp) then
           pmassi = massoftype(iamtype(iphase_soa(i)))
           fac    = pmassi*dfac ! to avoid round-off error
@@ -887,7 +905,7 @@ end subroutine sort_particles_in_cell
 !+
 !----------------------------------------------------------------
 subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,ixyzcachesize,ifirstincell,&
-& get_hj,fnode,remote_export)
+& get_hj,fnode,remote_export,neighbours_found)
 #ifdef PERIODIC
  use boundary, only:dxbound,dybound,dzbound
 #endif
@@ -909,14 +927,16 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,i
  logical, intent(in)                :: get_hj
  real,    intent(out),    optional  :: fnode(lenfgrav)
  logical, intent(out),    optional  :: remote_export(:)
+ integer, intent(out),    optional ::  neighbours_found
  integer, parameter :: istacksize = 300
  integer :: maxcache
  integer :: nstack(istacksize)
  integer :: ipart,n,istack,il,ir,npnode
  real :: dx,dy,dz,xsizej,rcutj
  real :: rcut,rcut2,r2
- real :: xoffset,yoffset,zoffset,tree_acc2
+ real :: xoffset,yoffset,zoffset,tree_acc2,radius 
  logical :: open_tree_node
+ integer :: neighleaf
 #ifdef GRAVITY
  real :: quads(6)
  real :: dr,totmass_node
@@ -928,6 +948,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,i
  hdly = 0.5*dybound
  hdlz = 0.5*dzbound
 #endif
+ tree_accuracy = 0.5
  tree_acc2 = tree_accuracy*tree_accuracy
  if (present(fnode)) fnode(:) = 0.
  rcut     = rcuti
@@ -940,10 +961,12 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,i
 
  if (present(remote_export)) remote_export = .false.
 
+ neighleaf = 0 
  nneigh = 0
  istack = 1
  nstack(istack) = irootnode
  open_tree_node = .false.
+ !print*,"entered routine"
 
  over_stack: do while(istack /= 0)
     n = nstack(istack)
@@ -977,17 +1000,32 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,i
        dz = dz - zoffset
     endif
 #endif
-    r2    = dx*dx + dy*dy + dz*dz
+    r2    = dx*dx + dy*dy + dz*dz !+ xsizei*xsizei
     if (get_hj) then  ! find neighbours within both hi and hj
        rcutj = radkern*node(n)%hmax
        rcut  = max(rcuti,rcutj)
     endif
+    !rcut = rcuti
+    ! call get_node_radius(node,ifirstincell,n,radius)
+    ! rcut = max(radius,rcuti)
     rcut2 = (xsizei + xsizej + rcut)**2   ! node size + search radius
 #ifdef GRAVITY
     open_tree_node = tree_acc2*r2 < xsizej*xsizej    ! tree opening criterion for self-gravity
+    open_tree_node = .false.
 #endif
-    if ((r2 < rcut2) .or. open_tree_node) then
+     !print*,"node is: ", n 
+    !print*,"parent: ", node(169) % parent 
+    if (n == 84) then 
+     !print*,"r2: ", r2, "rcut2: ",  rcut2
+     !call get_node_radius(node,ifirstincell,n,radius)
+     !print*, "search radius vs rcut + xsizej"
+     !print*, radius
+     !print*, xsizej + rcut
+    endif 
+    if ((r2 < rcut2)) then
        if_leaf: if (ifirstincell(n) /= 0) then ! once we hit a leaf node, retrieve contents into trial neighbour cache
+              neighleaf = neighleaf + 1
+              !print*, n
           if_global_walk: if (present(remote_export)) then
              ! id is stored in ipart as id + 1
              if (ifirstincell(n) /= (id + 1)) then
@@ -1050,23 +1088,649 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzh,xyzcache,i
              nstack(istack) = ir
           endif
        endif if_leaf
-#ifdef GRAVITY
-    elseif (present(fnode) .and. ((.not. present(remote_export)) .or. n < 2*nprocs-1)) then
-!
-!--long range force on node due to distant node, along node centres
-!  along with derivatives in order to perform series expansion
-!
+! #ifdef GRAVITY
+!     elseif (present(fnode) .and. ((.not. present(remote_export)) .or. n < 2*nprocs-1)) then
+! !
+! !--long range force on node due to distant node, along node centres
+! !  along with derivatives in order to perform series expansion
+! !
+! #ifdef FINVSQRT
+!        dr = finvsqrt(r2)
+! #else
+!        dr = 1./sqrt(r2)
+! #endif
+!        call compute_fnode(dx,dy,dz,dr,totmass_node,quads,fnode)
+! #endif
+     endif
+  enddo over_stack
+  !print*, "noneigh getneigh: ", neighleaf 
+  if (present(neighbours_found)) neighbours_found = neighleaf
+
+end subroutine getneigh
+
+
+subroutine interact(node, ifirstincell,xyzh,fxyzu_dtt,poten_dtt,nonodesfound)
+#ifdef PERIODIC
+ use boundary, only:dxbound,dybound,dzbound
+#endif
+  use omp_lib
+  use kernel, only:radkern
+  type(kdnode), intent(inout)        :: node(:)
+  integer, intent(in)                :: ifirstincell(:)
+
+  real,               intent(in)   :: xyzh(:,:)
+  real,               intent(out) :: fxyzu_dtt(:,:) ! Needed for direct sum between neighbours that are not sph neighbours 
+  real,               intent(out) :: poten_dtt(:)
+  integer, optional, intent(out) :: nonodesfound(:)
+  integer :: maxcache
+  !integer :: nstack(istacksize)
+  integer, parameter                   :: maxstacksize = 10000
+  type(denstreestack)       :: stack(maxstacksize)
+  type(denstreestacklocal)  :: stacklocal(maxstacksize)
+  integer                   :: top,nodeindex1, nodeindex2, leftindex, rightindex, regnodeindex, splitnodeindex, numthreads
+  integer, allocatable      :: istacklocal(:)
+  integer                   :: k 
+  logical, allocatable      :: threadworking(:)
+  integer :: n,istack,il,ir,npnode,i1,i2,j,jmax,nn,i
+  real :: dx,dy,dz,xsizei,xsizeimax,xsizejmax,xsizej,rcutj,rcuti
+  real :: rcut,rcut2,rcut2max,r2,hmax
+  real :: xoffset,yoffset,zoffset,tree_acc2
+  logical :: open_tree_node
+!#ifdef GRAVITY
+  real :: quads(6)
+  real :: dr,totmass_node
+  real :: fnode(20)
+  real :: c0,c1(3),c2(3,3),c3(3,3,3)
+  integer :: neighleaf,childleaf1(100),childleaf2(100),childleafcounter1,childleafcounter2,specialnode
+!#endif
+#ifdef PERIODIC
+  real :: hdlx,hdly,hdlz
+
+  hdlx = 0.5*dxbound
+  hdly = 0.5*dybound
+  hdlz = 0.5*dzbound
+#endif
+
+
+!tree_accuracy = 0.0
+!tree_acc2 = tree_accuracy*tree_accuracy
+!print*, tree_acc2 
+!print*, tree_accuracy
+
+!print*, "entered interact"
+!print*, "fxyzu :", fxyzu
+!stop 
+top = 1
+stack(top) % nodeindex1 = 1
+stack(top) % interactions(1) = 1 
+numthreads = 1 
+specialnode = 85
+!$omp parallel default(none) shared(numthreads)
+     numthreads = omp_get_num_threads()
+!$omp end parallel
+
+allocate(istacklocal(numthreads))
+allocate(threadworking(numthreads))
+!print*,"allocation started"
+!allocate(stack(maxstacksize))
+!allocate(stacklocal(maxstacksize))
+!print*,"allocation finished"
+
+threadworking = .false. 
+istacklocal = 0
+neighleaf = 0
+nonodesfound = 0 
+
+!$omp parallel default(none) &
+!$omp shared(node,ifirstincell,threadworking,top,istacklocal,stack,tree_acc2,fxyzu_dtt,poten_dtt,xyzh,specialnode,nonodesfound) &
+!$omp private(stacklocal,nodeindex1,nodeindex2,leftindex,rightindex,splitnodeindex,regnodeindex,k) &
+!$omp private(dx,dy,dz,totmass_node,xsizei,xsizeimax,xsizej,xsizejmax,quads,r2,open_tree_node,dr,fnode) &
+!$omp private(rcut2,rcut2max,rcut,rcuti,rcutj) & 
+!$omp private(childleaf1,childleaf2,childleafcounter1,childleafcounter2,i) &
+!$omp private(c0,c1,c2,c3) & 
+!$omp reduction(+:neighleaf)
+
+!print*, "entered parallel"
+!open(unit=13, file="well_separated.txt")
+do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
+
+     !$ k=omp_get_thread_num() + 1
+     !print*,"k: ", k
+     !print*,tree_acc2
+     !stop 
+
+    if (istacklocal(k) > 0 ) then ! pop off local stack
+        !!$omp critical 
+        !print*,"istacklocal", istacklocal(k)
+        nodeindex1 = stacklocal(istacklocal(k)) % nodeindex1
+        nodeindex2 = stacklocal(istacklocal(k)) % nodeindex2
+        !print*, "Node indexes : ", nodeindex1, nodeindex2
+
+        ! If the nodes are free then we can do work with them 
+        !if (nodes(nodeindex1) % nodefree .and. nodes(nodeindex2) % nodefree) then 
+          istacklocal(k) = istacklocal(k) - 1
+          threadworking(k) = .true.
+        !  threadworking(k) = .false.
+        !endif 
+        !!$omp critical  
+
+    else 
+      !$omp critical (stack)
+      if (top > 0) then 
+        !!$OMP TASK 
+       ! nodeindex1 = stack(top) % nodeindex1
+        !nodeindex2 = stack(top) % nodeindex2
+          ! If the nodes are free then we can do work with them 
+        !if (nodes(nodeindex1) % nodefree .and. nodes(nodeindex2) % nodefree) then 
+          !top = top - 1
+          call global_to_local(stack,stacklocal,k,istacklocal,top)
+          ! pop some work of the local stack 
+          call pop_local(nodeindex1,nodeindex2,stacklocal,istacklocal,k)
+          ! nodeindex1 = stacklocal(istacklocal(k)) % nodeindex1
+          ! nodeindex2 = stacklocal(istacklocal(k)) % nodeindex2
+          ! !print*, "node indexes :", nodeindex1, nodeindex2
+          ! istacklocal(k) = istacklocal(k) - 1
+          threadworking(k) = .true.
+          !threadworking(k) = .false.
+          !nodes(nodeindex1) % nodefree  = .false.
+          !nodes(nodeindex2) % nodefree  = .false.
+      else 
+        threadworking(k) = .false.
+      endif
+      !$omp end critical (stack)
+    endif 
+
+  if (threadworking(k)) then 
+      fnode = 0.
+      dx = 0. 
+      dy = 0. 
+      dz = 0.
+      dr = 0.
+      totmass_node = 0.
+      xsizej = 0.
+      xsizei = 0.
+      quads = 0. 
+      r2 = 0. 
+      open_tree_node = .false. 
+      rcut = 0.
+      rcuti = 0.
+      rcutj = 0. 
+      rcut2 = 0.
+      !tree_acc2 = 0.
+      !print*, tree_acc2
+      call get_node_data(node(nodeindex1),node(nodeindex2),dx,dy,dz,xsizei,xsizej,fnode,totmass_node,quads)
+      !quads = 0.
+      r2    = dx*dx + dy*dy + dz*dz
+      rcutj = radkern*node(nodeindex2) % hmax
+      rcuti = radkern*node(nodeindex1) % hmax 
+      rcut  = max(rcuti,rcutj)
+      xsizeimax = node(nodeindex1) % maxsize 
+      xsizejmax = node(nodeindex2) % maxsize
+      !rcut = rcuti
+      rcut2 = (xsizei + xsizej + rcut)**2   ! node size + search radius
+      rcut2max = (xsizeimax + xsizejmax + rcut)**2   ! node size + search radius
+
+      ! If nodes are equal 
+      if (nodeindex1 == nodeindex2) then 
+        if (ifirstincell(nodeindex1) > 0) then 
+           !print*, "leaf self interaction"
+           !call direct_sum_not_neighbour(nodeindex1, nodeindex2,fxyzu_dtt,poten_dtt,xyzh,node,ifirstincell)
+           !stop 
+        endif 
+        ! If nodes are equal but not leaf then split 
+        if (ifirstincell(nodeindex1) <= 0) then 
+                  leftindex = node(nodeindex1) % leftchild
+                  rightindex = node(nodeindex1) % rightchild 
+
+                  !$omp critical (stack)
+
+                  if (leftindex /= 0 .and. rightindex /= 0) then 
+                        ! top = top + 1
+                        ! stack(top) % nodeindex1 = leftindex
+                        ! stack(top) % interactions(1) = leftindex
+                        ! stack(top) % interactions(2) = rightindex
+
+                        call push_global(leftindex,leftindex,rightindex,stack,top)
+
+                        ! top = top + 1 
+                        ! stack(top) % nodeindex1 = rightindex
+                        ! stack(top) % interactions(1) = rightindex
+                        ! stack(top) % interactions(2) = leftindex
+
+                        call push_global(rightindex,rightindex,leftindex,stack,top)
+                  endif 
+
+                  !$omp end critical (stack)
+
+        endif
+
+      ! If well separated but not sph neighbour, calculate long range interactions 
+      else if (well_separated(node(nodeindex1), node(nodeindex2)) .and. r2 >= rcut2max  &
+       .and. ifirstincell(nodeindex1) <= 0 .and. ifirstincell(nodeindex2) <= 0) then  ! &
+        !.and. .not. check_child_overlap(node,nodeindex1,nodeindex2).and. .not. check_child_overlap(node,nodeindex2,nodeindex1)) then
+        !print*, "Well separated nodes: ", nodeindex1, nodeindex2 
+        !stop 
+        !write(13,*) nodeindex1,nodeindex2
+        !print*, "r2 and rcut2: ", r2, rcut2
+        !if (ifirstincell(nodeindex1) > 0) stop 
+        !if (ifirstincell(nodeindex2) > 0) stop 
+        if ( .not. well_separated(node(nodeindex2),node(nodeindex1))) then 
+            print*, "MAC BROKEN"
+            stop
+        endif  
+
 #ifdef FINVSQRT
        dr = finvsqrt(r2)
 #else
        dr = 1./sqrt(r2)
 #endif
-       call compute_fnode(dx,dy,dz,dr,totmass_node,quads,fnode)
-#endif
-    endif
- enddo over_stack
 
-end subroutine getneigh
+#ifdef GRAVITY
+       ! This should be a lock but this will do for now 
+       !$omp critical (node)
+       !print*, "fnode before: ", fnode(1:3)
+       !fnode = node(nodeindex1) % fnode 
+       fnode = 0. 
+       quads = 0. 
+       c0 = 0.
+       c1 = 0.
+       c2 = 0.
+       c3 = 0.
+       !call compute_coeff(dx,dy,dz,dr,totmass_node,quads,c0,c1,c2,c3)
+       !if (ifirstincell(nodeindex1) <= 0 .and. ifirstincell(nodeindex2) <= 0) then 
+       ! print*, "well separated not leaf:", nodeindex1, nodeindex2
+        !stop 
+       !endif 
+       !if (nodeindex1 == 11 .and. nodeindex2 == 16 .or. nodeindex1 == 16 .and. nodeindex2 == 11) then 
+       call compute_fnode(dx,dy,dz,dr,totmass_node,quads,fnode)
+     !else if (nodeindex1 == 11 .and. nodeindex2 == 17 .or. nodeindex1 == 17 .and. nodeindex2 == 11) then 
+       !call compute_fnode(dx,dy,dz,dr,totmass_node,quads,fnode)
+       !endif 
+       !if (nodeindex1 ==35) then 
+       !print*, "nodeindex2: ", nodeindex2
+      ! print*, "fnode is: ", fnode(1:3)
+      ! print*, "c1 is: ", c1 
+      ! print*, "force on node1 is: ", fnode(1)*node(nodeindex1) % mass, &
+      !  fnode(2)*node(nodeindex1) % mass, fnode(3)*node(nodeindex1) % mass
+
+       !print*, "force actual", -dr*dr*dr*dx*totmass_node, -dr*dr*dr*dy*totmass_node, -dr*dr*dr*dz*totmass_node  
+      !endif 
+       !stop 
+       ! STORE FNODE 
+       node(nodeindex1) % fnode = node(nodeindex1) % fnode + fnode 
+       ! call get_node_data(node(nodeindex2),node(nodeindex1),dx,dy,dz,xsizei,xsizej,fnode,totmass_node,quads)
+       ! r2    = dx*dx + dy*dy + dz*dz
+       ! dr    = 1./sqrt(r2)
+       ! fnode = 0. 
+       ! quads = 0. 
+       ! call compute_fnode(dx,dy,dz,dr,totmass_node,quads,fnode)
+       !  print*, "force on node2 is: ", fnode(1)*node(nodeindex2) % mass, &
+       ! fnode(2)*node(nodeindex2) % mass, fnode(3)*node(nodeindex2) % mass
+       !$omp end critical (node)
+#endif 
+       !endif 
+
+
+    !  If nodes are not well_separated and not equal then splitting needs to occur 
+    else 
+
+      !print*, "sizes: ", node(nodeindex1) % size, node(nodeindex2) % size
+      ! Find the splitnode 
+      if (node(nodeindex1) % size > node(nodeindex2) % size) then
+        !splitnode = nodes(nodeindex1)
+        splitnodeindex = nodeindex1
+        !regnode = nodes(nodeindex2)
+        regnodeindex = nodeindex2
+      else if (node(nodeindex2) % size > node(nodeindex1) % size)  then 
+        !splitnode = nodes(nodeindex2)
+        splitnodeindex = nodeindex2
+        !regnode = nodes(nodeindex1)
+        regnodeindex = nodeindex1
+      else 
+        ! If sizes are same take numberically larger node 
+        if (nodeindex1 > nodeindex2) then 
+          splitnodeindex = nodeindex1
+          !regnode = nodes(nodeindex2)
+          regnodeindex = nodeindex2
+        else 
+          splitnodeindex = nodeindex2
+          !regnode = nodes(nodeindex2)
+          regnodeindex = nodeindex1
+        endif 
+
+      endif 
+
+      !split larger node and push interactions to stack 
+      leftindex = node(splitnodeindex) % leftchild
+      rightindex = node(splitnodeindex) % rightchild
+
+
+      ! ! If split node is not leaf 
+       if (ifirstincell(splitnodeindex) <= 0) then 
+
+      !                    !print*,"leftindex: ", leftindex
+      !                    !print*,"rightindex: ", rightindex
+
+                        ! If splitting nodeindex1  push to global stack 
+                        if (nodeindex1 == splitnodeindex) then 
+                              !$omp critical (stack)
+                              if (leftindex /= 0) then 
+                                    call push_global(leftindex,regnodeindex,0,stack,top)
+                              endif 
+                              if (rightindex /= 0) then 
+                                    call push_global(rightindex,regnodeindex,0,stack,top)
+                              endif 
+                              !$omp end critical (stack)
+
+                        ! Otherwise if splitting nodeindex2 keep interactions on local stack 
+                        else 
+                  
+                              if (leftindex /= 0) then 
+                                    ! istacklocal(k) = istacklocal(k) + 1
+                                    ! stacklocal(istacklocal(k)) % nodeindex1 = regnodeindex
+                                    ! stacklocal(istacklocal(k)) % nodeindex2 = leftindex
+                                    call push_local(regnodeindex,leftindex,stacklocal,istacklocal,k)
+                              endif
+
+                              if (rightindex /= 0) then 
+                                    ! istacklocal(k) = istacklocal(k) + 1
+                                    ! stacklocal(istacklocal(k)) % nodeindex1 = regnodeindex
+                                    ! stacklocal(istacklocal(k)) % nodeindex2 = rightindex
+                                    call push_local(regnodeindex,rightindex,stacklocal,istacklocal,k)
+                              endif 
+
+                        endif
+    ! Leaf Node - Node 
+    ! If split node is leaf but regnode is not then perform direct sum 
+    else if (ifirstincell(splitnodeindex) > 0 .and. ifirstincell(regnodeindex) <= 0) then 
+        
+         !print*, "Leaf Node - Node"
+        ! If we are not sph trial neihgbours
+         ! if (r2<rcut2) then 
+         !  if (.not. check_parent_overlap(node,nodeindex1,nodeindex2)) then 
+         !       call direct_sum_not_neighbour(nodeindex1, nodeindex2,fxyzu_dtt,poten_dtt,xyzh,node,ifirstincell)
+         !   endif 
+         ! else 
+         !     call direct_sum_not_neighbour(nodeindex1, nodeindex2,fxyzu_dtt,poten_dtt,xyzh,node,ifirstincell)
+         ! endif 
+
+        !split larger node 
+
+        leftindex = node(regnodeindex) % leftchild
+        rightindex = node(regnodeindex) % rightchild
+
+                         ! If splitting node push to global stack 
+                        if (nodeindex1 == regnodeindex) then 
+                              !$omp critical (stack)
+                              if (leftindex /= 0) then 
+                                    ! top = top + 1
+                                    ! stack(top) % nodeindex1 = leftindex
+                                    ! stack(top) % interactions(1) = splitnodeindex
+                                    call push_global(leftindex,splitnodeindex,0,stack,top)
+                              endif 
+                              if (rightindex /= 0) then 
+                                    ! top = top + 1
+                                    ! stack(top) % nodeindex1 = rightindex
+                                    ! stack(top) % interactions(1) = splitnodeindex
+                                    call push_global(rightindex,splitnodeindex,0,stack,top)
+                              endif 
+                              !$omp end critical (stack)
+
+                        else 
+                  
+                              if (leftindex /= 0) then 
+                                    ! istacklocal(k) = istacklocal(k) + 1
+                                    ! stacklocal(istacklocal(k)) % nodeindex1 = splitnodeindex
+                                    ! stacklocal(istacklocal(k)) % nodeindex2 = leftindex
+                                    call push_local(splitnodeindex,leftindex,stacklocal,istacklocal,k)
+                              endif
+
+                              if (rightindex /= 0) then 
+                                    ! istacklocal(k) = istacklocal(k) + 1
+                                    ! stacklocal(istacklocal(k)) % nodeindex1 = splitnodeindex
+                                    ! stacklocal(istacklocal(k)) % nodeindex2 = rightindex
+                                    call push_local(splitnodeindex,rightindex,stacklocal,istacklocal,k)
+                              endif 
+
+                        endif 
+    ! Leaf Node - Leaf Node 
+    else  
+        !print*, "direct leaf nodes"
+        !print*, "ifirstincells:", ifirstincell(nodeindex1),ifirstincell(nodeindex2)
+        
+         if (r2<rcut2) then 
+          if (.not. check_parent_overlap(node,nodeindex1,nodeindex2)) then
+               !if (nodeindex1 == specialnode) neighleaf = neighleaf + 1 
+               nonodesfound(nodeindex1) = nonodesfound(nodeindex1) + 1 
+               call direct_sum_not_neighbour(nodeindex1, nodeindex2,fxyzu_dtt,poten_dtt,xyzh,node,ifirstincell)
+           endif 
+         else 
+             !if (nodeindex1 == specialnode ) neighleaf = neighleaf + 1
+             nonodesfound(nodeindex1) = nonodesfound(nodeindex1) + 1
+             call direct_sum_not_neighbour(nodeindex1, nodeindex2,fxyzu_dtt,poten_dtt,xyzh,node,ifirstincell)
+         endif 
+          
+
+      endif 
+
+  endif 
+endif 
+enddo 
+
+!$omp end parallel 
+
+!print*, "neighleaf: ",neighleaf
+!print*,"interact finished"
+!close(13)
+!stop 
+
+end subroutine interact
+
+subroutine evaluate(node, ifirstincell)
+  use omp_lib
+  type(kdnode), intent(inout)        :: node(:)
+  integer, intent(in)                :: ifirstincell(:)
+   integer :: stacksize, top, toplocal 
+   ! Openmp disables heap allocation so this should be allocatable 
+   type(evaluate_stack_data) :: stack(1000)
+   real :: c0,c1(3),c2(3,3),c3(3,3,3),z0(3),z1(3)
+   real :: bodaccel(3),xbod(3),fnode(20),bodpot
+   integer :: bodyindex,i,j,iter,numthreads,toptemp,k
+   integer :: currentnodeindex, childnodeindex
+   real    :: dx,dy,dz
+   logical, allocatable :: threadworking(:)
+   integer, allocatable :: istacklocal(:)
+
+   top = 1
+   iter = 1
+
+   ! Push the root node 
+   stack(1) % nodeindex = 1
+   stack(1) % fnode = 0.
+   stack(1) % z0 = 0. 
+   currentnodeindex = 1 
+   numthreads = 1
+   ! get number of OpenMPthreads
+   !$omp parallel default(none) shared(numthreads)
+     numthreads = omp_get_num_threads()
+   !$omp end parallel
+   allocate(threadworking(numthreads))
+   allocate(istacklocal(numthreads))
+   threadworking = .true.
+
+
+  !$omp parallel default(none) &
+  !$omp shared(stack,top,node,numthreads,threadworking,istacklocal) &
+  !$omp private(z0,z1,c0,c1,c2,c3) &
+  !$omp private(currentnodeindex,bodyindex,xbod,bodaccel,childnodeindex,dx,dy,dz,k,fnode)
+  
+   !$ k=omp_get_thread_num() + 1
+   ! local stack is currently empty 
+   istacklocal(k) = 0 
+   ! Just for compiler errors 
+   !currentnode = node(1)
+   !print*,"Thread is: ", k
+   ! here top is the top of the global stack 
+   ! Push the root node 
+   
+  over_stack: do while (top > 0)  
+   !do j=1, top
+    !print*, "Thread number is: ", j
+    !print*, "The current iteration is: ",iter
+    !print*, "Top is: ", top
+    !print*, "local stack top: ", istacklocal(k)
+    !iter = iter + 1 
+    ! POP ITEM FROM STACK 
+    !print*,"istacklocal: ",istacklocal(k)
+    ! pop of local stack 
+    !if (istacklocal(k) > 0 ) then 
+    !    currentnode = stack(istacklocal(k)) % node
+    !    z0 = stack(istacklocal(k)) % z0
+    !    c0 = stack(istacklocal(k)) % c0
+     !   c1 = stack(istacklocal(k)) % c1
+     !   c2 = stack(istacklocal(k)) % c2 
+     !   c3 = stack(istacklocal(k)) % c3 
+
+     !   istacklocal(k) = istacklocal(k) - 1 
+      !  threadworking(k) = .true.
+    !else 
+    !$omp critical(globalstack) 
+        if (top > 0) then 
+        currentnodeindex = stack(top) % nodeindex
+        z0 = stack(top) % z0
+        fnode = stack(top) % fnode 
+
+        top = top - 1 
+        threadworking(k) = .true. 
+        !print*,"working on thread",k
+        else
+        threadworking(k) = .false.
+        
+        endif 
+    !$omp end critical(globalstack)
+    !endif 
+    !if top
+  ! If thread has work to do, do it 
+  if (threadworking(k)) then 
+    
+     ! print*, "data"
+     ! print*,"current node", currentnodeindex
+     ! print*,"force ",fnode(1:3)
+     ! print*,"poten", fnode(20)
+     ! print*,"xcen prev: ",z0
+
+
+    ! Perform evaluate on popped item 
+
+   z1 = node(currentnodeindex) % xcen 
+  
+
+  ! TRANSLATE TAYLOR SERIES T0 TO CENTER OF MASS OF A
+  !print*, "Translating expansion: "
+  !call translate_expansion_center(z0,z1,c0,c1,c2,c3)
+  dx = z1(1)-z0(1)
+  dy = z1(2)-z0(2)
+  dz = z1(3)-z0(3)
+
+  ! WILL ONLY WORK FOR A SECOND ORDER EXPANSION
+  ! this is disgusting but needed for compilation 
+#ifdef GRAVITY 
+  !!$omp critical (node)
+  ! c0 = fnode(20)
+  ! c1(1) =  fnode(1)
+  ! c1(2) =  fnode(2)
+  ! c1(3) =  fnode(3)
+  ! c2(1,1) = fnode(4)
+  ! c2(1,2) = fnode(5)
+  ! c2(1,3) = fnode(6)
+  ! c2(2,1) = fnode(5)
+  ! c2(2,2) = fnode(7)
+  ! c2(2,3) = fnode(8)
+  ! c2(3,1) = fnode(6)
+  ! c2(3,2) = fnode(8)
+  ! c2(3,3) = fnode(9)
+  !if (fnode(20) /= 0.) then 
+  !print*, fnode(20)
+  !stop 
+  !print*, "fnode before: ", fnode
+  !call expand_fgrav_in_taylor_series(fnode,dx,dy,dz,c1(1),c1(2),c1(3),c0,c2(1),c2(2),c2(3),c2(4),c2(5),c2(6))
+  call translate_fgrav_in_taylor_series(fnode,dx,dy,dz)
+ !call translate_expansion_center(z0,z1,c0,c1,c2,c3)
+  ! print*,"value comparision"
+  ! print*, fnode(1),fnode(2),fnode(3)
+  ! print*, c1(1),c1(2),c1(3)
+  !!$omp critical (node)
+  ! !node(currentnodeindex) % fnode    = 0. 
+  ! ! ! c1
+  !  node(currentnodeindex) % fnode(1) = node(currentnodeindex) % fnode(1) +  c1(1) 
+  !  node(currentnodeindex) % fnode(2) = node(currentnodeindex) % fnode(2) + c1(2)
+  !  node(currentnodeindex) % fnode(3) = node(currentnodeindex) % fnode(3) + c1(3)
+  ! ! ! ! c2 
+  ! !  node(currentnodeindex) % fnode(4) = node(currentnodeindex) % fnode(4) + c2(1)
+  ! !  node(currentnodeindex) % fnode(5) = node(currentnodeindex) % fnode(5) + c2(2)
+  ! !  node(currentnodeindex) % fnode(6) = node(currentnodeindex) % fnode(6) + c2(3)
+  ! !  node(currentnodeindex) % fnode(7) = node(currentnodeindex) % fnode(7) + c2(4)
+  ! !  node(currentnodeindex) % fnode(8) = node(currentnodeindex) % fnode(8) + c2(5)
+  ! !  node(currentnodeindex) % fnode(9) = node(currentnodeindex) % fnode(9) + c2(6)
+
+  
+  !  node(currentnodeindex) % fnode(4:20) = node(currentnodeindex) % fnode(4:20) + fnode(4:20)
+  ! node(currentnodeindex) % fnode(20) = node(currentnodeindex) % fnode(20) + c0 
+  !!$omp end critical (node)
+  !node(currentnodeindex) % fnode(1) = 2.
+  !print*, "fnode trans: ", fnode 
+  node(currentnodeindex) % fnode = node(currentnodeindex) % fnode + fnode 
+  !print*, "fnode node: ", node(currentnodeindex) % fnode 
+  !endif 
+  fnode = node(currentnodeindex) % fnode
+  !print*, fnode
+  !!$omp end critical (node)
+#endif 
+  ! FOR CHILDREN OF A 
+  ! change center of mass
+  z0 = z1
+   if (node(currentnodeindex) % leftchild /= 0) then  
+    !print*, "Childnode index: ", currentnode % children(i)
+    childnodeindex = node(currentnodeindex) % leftchild
+    ! if threads are waiting push to global stack 
+      !$omp critical(globalstack)
+      top = top + 1 
+      ! Push Children onto stack 
+      stack(top) % nodeindex = childnodeindex
+      stack(top) % z0 = z0
+      stack(top) % fnode = fnode
+      !$omp end critical(globalstack)
+
+
+    endif 
+
+   if (node(currentnodeindex) % rightchild /= 0) then  
+    !print*, "Childnode index: ", currentnode % children(i)
+    childnodeindex = node(currentnodeindex) % rightchild
+    ! if threads are waiting push to global stack 
+      !$omp critical(globalstack)
+      top = top + 1 
+      ! Push Children onto stack 
+      stack(top) % nodeindex = childnodeindex
+      stack(top) % z0 = z0
+      stack(top) % fnode = fnode
+      !$omp end critical(globalstack)
+
+
+   endif 
+
+ endif 
+
+
+
+    
+  !print*, "top is: ", top 
+enddo over_stack
+!stop 
+!$omp end parallel
+
+
+end subroutine evaluate
 
 !-----------------------------------------------------------
 !+
@@ -1156,6 +1820,188 @@ pure subroutine compute_fnode(dx,dy,dz,dr,totmass,quads,fnode)
 
 end subroutine compute_fnode
 
+subroutine compute_coeff(dx,dy,dz,dr,totmass,quads,c0,c1,c2,c3)
+ real, intent(in) :: dx,dy,dz,dr,totmass
+ real, intent(in) :: quads(6)
+ !real, intent(inout) :: coeff(4)
+ real, intent(inout) :: c0,c1(3),c2(3,3),c3(3,3,3)
+real :: dr3,dr4,dr5,dr6,dr3m,rx,ry,rz,qxx,qxy,qxz,qyy,qyz,qzz
+ real :: dr4m3,rijQij,riQix,riQiy,riQiz,fqx,fqy,fqz
+ real :: dfxdxq,dfxdyq,dfxdzq,dfydyq,dfydzq,dfzdzq
+ real :: d2fxxxq,d2fxxyq,d2fxxzq,d2fxyyq,d2fxyzq
+ real :: d2fxzzq,d2fyyyq,d2fyyzq,d2fyzzq,d2fzzzq
+
+ real :: d0,d1
+ real :: d2,d3
+ !real :: d1arry(3)
+ real :: rarry(3)
+ real :: r,dr2
+ integer :: i, j, k
+
+
+ r = sqrt(dx**2 + dy**2 + dz**2)
+
+ rarry = (/dx,dy,dz/)
+
+ rx  = dx*dr
+ ry  = dy*dr
+ rz  = dz*dr
+
+ ! Note dr = 1/r
+ !print*, "dr"
+ d0 = dr
+ dr2 = dr*dr
+ dr3 = dr2*dr
+ dr4 = dr3*dr
+ dr5 = dr4*dr
+ !print*, d0
+ d1 = -dr3
+ !print*, 'd1'
+ !print*, d1*totmass
+ ! Why is this 3 not 2?????
+ d2 = 3.*dr3*dr2
+ !print*, d2
+ d3 = -5.*d2*dr2
+
+ dr4m3 = 3.*totmass*dr4
+
+ !quads = 0.
+ qxx = quads(1)
+ qxy = quads(2)
+ qxz = quads(3)
+ qyy = quads(4)
+ qyz = quads(5)
+ qzz = quads(6)
+ rijQij = (rx*rx*qxx + ry*ry*qyy + rz*rz*qzz + 2.*(rx*ry*qxy + rx*rz*qxz + ry*rz*qyz))
+ riQix = (rx*qxx + ry*qxy + rz*qxz)
+ riQiy = (rx*qxy + ry*qyy + rz*qyz)
+ riQiz = (rx*qxz + ry*qyz + rz*qzz)
+ fqx = dr4*(riQix - 2.5*rx*rijQij)
+ fqy = dr4*(riQiy - 2.5*ry*rijQij)
+ fqz = dr4*(riQiz - 2.5*rz*rijQij)
+ dfxdxq = dr5*(qxx - 10.*rx*riQix - 2.5*rijQij   + 17.5*rx*rx*rijQij)
+ dfxdyq = dr5*(qxy -  5.*ry*riQix - 5.0*rx*riQiy + 17.5*rx*ry*rijQij)
+ dfxdzq = dr5*(qxz -  5.*rx*riQiz - 5.0*rz*riQix + 17.5*rx*rz*rijQij)
+ dfydyq = dr5*(qyy - 10.*ry*riQiy - 2.5*rijQij   + 17.5*ry*ry*rijQij)
+ dfydzq = dr5*(qyz -  5.*ry*riQiz - 5.0*rz*riQiy + 17.5*ry*rz*rijQij)
+ dfzdzq = dr5*(qzz - 10.*rz*riQiz - 2.5*rijQij   + 17.5*rz*rz*rijQij)
+ d2fxxxq = dr6*(-15.*qxx*rx + 105.*rx*rx*riQix - 15.*riQix - 157.5*rx*rx*rx*rijQij + 52.5*rx*rijQij)
+ d2fxxyq = dr6*(35.*rx*rx*riQiy -  5.*qxx*ry - 5.*riQiy + 17.5*ry*rijQij - 157.5*rx*rx*ry*rijQij &
+              + 70.*rx*ry*riQix - 10.*qxy*rx)
+ d2fxxzq = dr6*(35.*rx*rx*riQiz -  5.*qxx*rz - 5.*riQiz + 17.5*rz*rijQij - 157.5*rx*rx*rz*rijQij &
+              + 70.*rx*rz*riQix - 10.*qxz*rx)
+ d2fxyyq = dr6*(70.*rx*ry*riQiy - 10.*qxy*ry - 5.*riQix + 17.5*rx*rijQij - 157.5*rx*ry*ry*rijQij &
+              + 35.*ry*ry*riQix -  5.*qyy*rx)
+ d2fxyzq = dr6*(35.*rx*ry*riQiz -  5.*qyz*rx  &
+              + 35.*ry*rz*riQix -  5.*qxz*ry  &
+              + 35.*rx*rz*riQiy -  5.*qxy*rz                             - 157.5*rx*ry*rz*rijQij)
+ d2fxzzq = dr6*(70.*rx*rz*riQiz - 10.*qxz*rz - 5.*riQix + 17.5*rx*rijQij - 157.5*rx*rz*rz*rijQij &
+              + 35.*rz*rz*riQix -  5.*qzz*rx)
+ d2fyyyq = dr6*(-15.*qyy*ry + 105.*ry*ry*riQiy - 15.*riQiy - 157.5*ry*ry*ry*rijQij + 52.5*ry*rijQij)
+ d2fyyzq = dr6*(35.*ry*ry*riQiz -  5.*qyy*rz - 5.*riQiz + 17.5*rz*rijQij - 157.5*ry*ry*rz*rijQij &
+              + 70.*ry*rz*riQiy - 10.*qyz*ry)
+ d2fyzzq = dr6*(70.*ry*rz*riQiz - 10.*qyz*rz - 5.*riQiy + 17.5*ry*rijQij - 157.5*ry*rz*rz*rijQij &
+              + 35.*rz*rz*riQiy -  5.*qzz*ry)
+ d2fzzzq = dr6*(-15.*qzz*rz + 105.*rz*rz*riQiz - 15.*riQiz - 157.5*rz*rz*rz*rijQij + 52.5*rz*rijQij)
+ ! C0 = totmass * Greens function
+ ! scalar 
+ c0 = c0 + totmass * dr
+ 
+ ! C1 = MB*Ri*D1
+ ! Should be a vector
+ !do i=1, 3
+ !   c1(i) = c1(i) + totmass*rarry(i)*d1
+ !enddo
+
+ ! UNROLL LOOPS
+ c1(1) = c1(1) + totmass*rarry(1)*d1 !+ fqx
+ c1(2) = c1(2) + totmass*rarry(2)*d1 !+ fqy
+ c1(3) = c1(3) + totmass*rarry(3)*d1 !+ fqz
+
+ ! C2 = MB kronecker ij D1 + MB Ri Rj D2
+ ! rank 2 tensor 
+ !do j=1,3
+ !  do i=1,3
+ !     c2(i,j) = c2(i,j) + totmass*delta(i,j)*d1 +  totmass*rarry(i)*rarry(j)*d2
+ !  enddo 
+ !enddo 
+
+ ! UNROLLLLLL
+
+ c2(1,1) = c2(1,1) + totmass*d1  - totmass*3.*rx*rx*d1 !+ dfxdxq 
+ c2(1,2) = c2(1,2) - totmass*3.*rx*ry*d1 !+ dfxdyq ! dfx/dy = dfy/dx
+ c2(1,3) = c2(1,3) - totmass*3.*rx*rz*d1 !+ dfxdzq ! dfx/dz = dfz/dx
+ c2(2,1) = c2(2,1) - totmass*3.*ry*rx*d1 !+ dfxdyq ! dfx/dy = dfy/dx
+ c2(2,2) = c2(2,2) + totmass*d1  - totmass*3.*d1*ry*ry !+ dfydyq ! dfy/dy
+ c2(2,3) = c2(2,3) - totmass*3.*ry*rz*d1 !+ dfydzq ! dfy/dz = dfz/dy
+ c2(3,1) = c2(3,1) - totmass*3.*rz*rx*d1 !+ dfxdzq ! dfx/dz = dfz/dx
+ c2(3,2) = c2(3,2) - totmass*3.*rz*ry*d1 !+ dfydzq ! dfy/dz = dfz/dy
+ c2(3,3) = c2(3,3) + totmass*d1 - totmass*3.*rz*rz*d1 !+ dfzdzq 
+ 
+ ! C3
+ ! rank3 tensor
+ !do k=1,3
+ !   do j=1,3
+ !      do i=1,3
+  !       c3(i,j,k) =  c3(i,j,k) +  totmass*delta(i,j)*rarry(k)*d2 + totmass*delta(j,k)*rarry(i)*d2 &
+  !        + totmass * delta(k,i)*rarry(j)*d2 + totmass*rarry(i)*rarry(j)*rarry(k)*d3
+  !    enddo 
+   ! enddo
+ !enddo 
+
+ ! UNROLLLLLLLLLLLLLLLLLLL
+
+ c3(1,1,1) = c3(1,1,1) -  dr4m3*(5.*rx*rx*rx - 3.*rx) !+ d2fxxxq ! d2fxdxdx
+ c3(1,1,2) = c3(1,1,2) - dr4m3*(5.*rx*rx*ry - ry)    !+ d2fxxyq ! d2fxdxdy
+ c3(1,1,3) = c3(1,1,3) - dr4m3*(5.*rx*rx*rz - rz)    !+ d2fxxzq ! d2fxdxdz
+ c3(1,2,1) = c3(1,2,1) - dr4m3*(5.*rx*rx*ry - ry)    !+ d2fxxyq ! d2fxdxdy
+ c3(1,2,2) = c3(1,2,2) - dr4m3*(5.*rx*ry*ry - rx)    !+ d2fxyyq ! d2fxdydy
+ c3(1,2,3) = c3(1,2,3) - dr4m3*(5.*rx*ry*rz)         !+ d2fxyzq ! d2fxdydz
+ c3(1,3,1) = c3(1,3,1) - dr4m3*(5.*rx*rx*rz - rz)    !+ d2fxxzq ! d2fxdxdz
+ c3(1,3,2) = c3(1,3,2) - dr4m3*(5.*rx*ry*rz)         !+ d2fxyzq ! d2fxdydz
+ c3(1,3,3) = c3(1,3,3) - dr4m3*(5.*rx*rz*rz - rx)    !+ d2fxzzq ! d2fxdzdz
+ c3(2,1,1) = c3(2,1,1) - dr4m3*(5.*rx*rx*ry - ry)    !+ d2fxxyq ! d2fxdxdy
+ c3(2,1,2) = c3(2,1,2) - dr4m3*(5.*rx*ry*ry - rx)    !+ d2fxyyq ! d2fxdydy
+ c3(2,1,3) = c3(2,1,3) - dr4m3*(5.*rx*ry*rz)         !+ d2fxyzq ! d2fxdydz
+ c3(2,2,1) = c3(2,2,1) - dr4m3*(5.*rx*ry*ry - rx)    !+ d2fxyyq ! d2fxdydy
+ c3(2,2,2) = c3(2,2,2) - dr4m3*(5.*ry*ry*ry - 3.*ry) !+ d2fyyyq ! d2fydydy
+ c3(2,2,3) = c3(2,2,3) - dr4m3*(5.*ry*ry*rz - rz)    !+ d2fyyzq ! d2fydydz
+ c3(2,3,1) = c3(2,3,1) - dr4m3*(5.*rx*ry*rz)         !+ d2fxyzq ! d2fxdydz
+ c3(2,3,2) = c3(2,3,2) - dr4m3*(5.*ry*ry*rz - rz)    !+ d2fyyzq ! d2fydydz
+ c3(2,3,3) = c3(2,3,3) - dr4m3*(5.*ry*rz*rz - ry)    !+ d2fyzzq ! d2fydzdz
+ c3(3,1,1) = c3(3,1,1) - dr4m3*(5.*rx*rx*rz - rz)    !+ d2fxxzq ! d2fxdxdz
+ c3(3,1,2) = c3(3,1,2) - dr4m3*(5.*rx*ry*rz)         !+ d2fxyzq ! d2fxdydz
+ c3(3,1,3) = c3(3,1,3) - dr4m3*(5.*rz*rx*rz - rx)    !+ d2fxzzq ! d2fxdxdz
+ c3(3,2,1) = c3(3,2,1) - dr4m3*(5.*rx*ry*rz)         !+ d2fxyzq ! d2fxdydz
+ c3(3,2,2) = c3(3,2,2) - dr4m3*(5.*ry*ry*rz - rz)    !+ d2fyyzq ! d2fydydz
+ c3(3,2,3) = c3(3,2,3) - dr4m3*(5.*ry*rz*rz - ry)    !+ d2fyzzq ! d2fydzdz
+ c3(3,3,1) = c3(3,3,1) - dr4m3*(5.*rx*rz*rz - rx)    !+ d2fxzzq ! d2fxdzdz
+ c3(3,3,2) = c3(3,3,2) - dr4m3*(5.*ry*rz*rz - ry)    !+ d2fyzzq ! d2fydzdz
+ c3(3,3,3) = c3(3,3,3) - dr4m3*(5.*rz*rz*rz - 3.*rz) ! + d2fzzzq ! d2fzdzdz
+
+
+ !print*, "Coeff 0:"
+ !print*, c0
+
+ !print*, "Coeff 1:"
+ !print*, c1
+
+ !print*, "Coeff 2:"
+ !print*, c2
+
+ !print*, "Coeff 3:"
+ !print*, c3 
+
+ !print*, "dr is: "
+ !print*,"Components are: "
+ !print*, totmass*delta(2,1)*rarry(1)*d2
+ !print*, totmass*delta(1,1)*rarry(2)*d2
+ !print*, totmass*delta(1,2)*rarry(1)*d2
+ !print*, dr
+
+
+end subroutine compute_coeff
+
 !----------------------------------------------------------------
 !+
 !  Internal subroutine to compute the Taylor-series expansion
@@ -1172,10 +2018,11 @@ end subroutine compute_fnode
 !   fxi,fyi,fzi : gravitational force at the new position
 !+
 !----------------------------------------------------------------
-pure subroutine expand_fgrav_in_taylor_series(fnode,dx,dy,dz,fxi,fyi,fzi,poti)
+pure subroutine expand_fgrav_in_taylor_series(fnode,dx,dy,dz,fxi,fyi,fzi,poti,dfxxi,dfxyi,dfxzi,dfyyi,dfyzi,dfzzi)
  real, intent(in)  :: fnode(lenfgrav)
  real, intent(in)  :: dx,dy,dz
  real, intent(out) :: fxi,fyi,fzi,poti
+ real, intent(out), optional              :: dfxxi,dfxyi,dfxzi,dfyyi,dfyzi,dfzzi
  real :: dfxx,dfxy,dfxz,dfyy,dfyz,dfzz
  real :: d2fxxx,d2fxxy,d2fxxz,d2fxyy,d2fxyz,d2fxzz,d2fyyy,d2fyyz,d2fyzz,d2fzzz
 
@@ -1188,6 +2035,9 @@ pure subroutine expand_fgrav_in_taylor_series(fnode,dx,dy,dz,fxi,fyi,fzi,poti)
  dfyy = fnode(7)
  dfyz = fnode(8)
  dfzz = fnode(9)
+
+ 
+
  d2fxxx = fnode(10)
  d2fxxy = fnode(11)
  d2fxxz = fnode(12)
@@ -1200,19 +2050,161 @@ pure subroutine expand_fgrav_in_taylor_series(fnode,dx,dy,dz,fxi,fyi,fzi,poti)
  d2fzzz = fnode(19)
  poti = fnode(20)
 
- fxi = fxi + dx*(dfxx + 0.5*(dx*d2fxxx + dy*d2fxxy + dz*d2fxxz)) &
-           + dy*(dfxy + 0.5*(dx*d2fxxy + dy*d2fxyy + dz*d2fxyz)) &
-           + dz*(dfxz + 0.5*(dx*d2fxxz + dy*d2fxyz + dz*d2fxzz))
- fyi = fyi + dx*(dfxy + 0.5*(dx*d2fxxy + dy*d2fxyy + dz*d2fxyz)) &
-           + dy*(dfyy + 0.5*(dx*d2fxyy + dy*d2fyyy + dz*d2fyyz)) &
-           + dz*(dfyz + 0.5*(dx*d2fxyz + dy*d2fyyz + dz*d2fyzz))
- fzi = fzi + dx*(dfxz + 0.5*(dx*d2fxxz + dy*d2fxyz + dz*d2fxzz)) &
-           + dy*(dfyz + 0.5*(dx*d2fxyz + dy*d2fyyz + dz*d2fyzz)) &
-           + dz*(dfzz + 0.5*(dx*d2fxzz + dy*d2fyzz + dz*d2fzzz))
+ fxi = fxi + dx*(dfxx) & !  + 0.5*(dx*d2fxxx + dy*d2fxxy + dz*d2fxxz)) &
+           + dy*(dfxy) & ! + 0.5*(dx*d2fxxy + dy*d2fxyy + dz*d2fxyz)) &
+           + dz*(dfxz)   ! + 0.5*(dx*d2fxxz + dy*d2fxyz + dz*d2fxzz))
+ fyi = fyi + dx*(dfxy) & ! + 0.5*(dx*d2fxxy + dy*d2fxyy + dz*d2fxyz)) &
+           + dy*(dfyy) & ! + 0.5*(dx*d2fxyy + dy*d2fyyy + dz*d2fyyz)) &
+           + dz*(dfyz)  ! + 0.5*(dx*d2fxyz + dy*d2fyyz + dz*d2fyzz))
+ fzi = fzi + dx*(dfxz) & !+ 0.5*(dx*d2fxxz + dy*d2fxyz + dz*d2fxzz)) &
+           + dy*(dfyz) & !+ 0.5*(dx*d2fxyz + dy*d2fyyz + dz*d2fyzz)) &
+           + dz*(dfzz)   ! + 0.5*(dx*d2fxzz + dy*d2fyzz + dz*d2fzzz))
+
+ ! if (present(dfxxi)) then 
+ ! ! The c2 field tensor to be translated 
+ !  !print*, "translated"
+ !  dfxxi = fnode(4)
+ !  dfxyi = fnode(5)
+ !  dfxzi = fnode(6)
+ !  dfyyi = fnode(7)
+ !  dfyzi = fnode(8)
+ !  dfzzi = fnode(9)
+  ! dfxxi = dfxxi + dx*(d2fxxx + d2fxxy + d2fxxz)
+  ! dfxyi = dfxyi + dy*(d2fxxy + d2fxyy + d2fxyz)
+  ! dfxzi = dfxzi + dz*(d2fxxz + d2fxyz + d2fxzz)
+  ! dfyyi = dfyyi + dy*(d2fxyy + d2fyyy + d2fyyz)
+  ! dfyzi = dfyzi + dz*(d2fxyz + d2fyyz + d2fyzz)
+  ! dfzzi = dfzzi + dz*(d2fxzz + d2fyzz + d2fzzz)
+ ! endif 
  poti = poti - (dx*fxi + dy*fyi + dz*fzi)
 
  return
 end subroutine expand_fgrav_in_taylor_series
+
+pure subroutine translate_fgrav_in_taylor_series(fnode,dx,dy,dz)
+ real, intent(inout)  :: fnode(lenfgrav)
+ real, intent(in)  :: dx,dy,dz
+ real :: fnodeold(lenfgrav)
+ real :: dfxx,dfxy,dfxz,dfyy,dfyz,dfzz
+ real :: d2fxxx,d2fxxy,d2fxxz,d2fxyy,d2fxyz,d2fxzz,d2fyyy,d2fyyz,d2fyzz,d2fzzz
+
+ ! fxi = fnode(1)
+ ! fyi = fnode(2)
+ ! fzi = fnode(3)
+ dfxx = fnode(4)
+ dfxy = fnode(5)
+ dfxz = fnode(6)
+ dfyy = fnode(7)
+ dfyz = fnode(8)
+ dfzz = fnode(9)
+
+ 
+
+ d2fxxx = fnode(10)
+ d2fxxy = fnode(11)
+ d2fxxz = fnode(12)
+ d2fxyy = fnode(13)
+ d2fxyz = fnode(14)
+ d2fxzz = fnode(15)
+ d2fyyy = fnode(16)
+ d2fyyz = fnode(17)
+ d2fyzz = fnode(18)
+ d2fzzz = fnode(19)
+ ! poti = fnode(20)
+
+ fnodeold = fnode 
+
+ fnode(1) = fnodeold(1) + dx*(dfxx) & !  + 0.5*(dx*d2fxxx + dy*d2fxxy + dz*d2fxxz)) &
+           + dy*(dfxy) &  !+ 0.5*(dx*d2fxxy + dy*d2fxyy + dz*d2fxyz)) &
+           + dz*(dfxz) !   + 0.5*(dx*d2fxxz + dy*d2fxyz + dz*d2fxzz))
+ fnode(2) = fnodeold(2) + dx*(dfxy) & !  + 0.5*(dx*d2fxxy + dy*d2fxyy + dz*d2fxyz)) &
+           + dy*(dfyy) & !  + 0.5*(dx*d2fxyy + dy*d2fyyy + dz*d2fyyz)) &
+           + dz*(dfyz)  ! + 0.5*(dx*d2fxyz + dy*d2fyyz + dz*d2fyzz))
+ fnode(3) = fnodeold(3) + dx*(dfxz) & ! + 0.5*(dx*d2fxxz + dy*d2fxyz + dz*d2fxzz)) &
+           + dy*(dfyz) & !   + 0.5*(dx*d2fxyz + dy*d2fyyz + dz*d2fyzz)) &
+           + dz*(dfzz) !   + 0.5*(dx*d2fxzz + dy*d2fyzz + dz*d2fzzz))
+
+ ! ! The c2 field tensor to be translated 
+
+ !  fnode(4) = fnodeold(4) + dx*(d2fxxx + d2fxxy + d2fxxz)
+ !  fnode(5) = fnodeold(5) + dy*(d2fxxy + d2fxyy + d2fxyz)
+ !  fnode(6) = fnodeold(6) + dz*(d2fxxz + d2fxyz + d2fxzz)
+ !  fnode(7) = fnodeold(7) + dy*(d2fxyy + d2fyyy + d2fyyz)
+ !  fnode(8) = fnodeold(8) + dz*(d2fxyz + d2fyyz + d2fyzz)
+ !  fnode(9) = fnodeold(9) + dz*(d2fxzz + d2fyzz + d2fzzz)
+ ! ! endif 
+ !   fnode(10:20) = fnodeold(10:20)
+  !poti = poti - (dx*fxi + dy*fyi + dz*fzi)
+
+ return
+end subroutine translate_fgrav_in_taylor_series
+
+subroutine translate_expansion_center(z0,z1,c0,c1,c2,c3)
+  real, intent(in) :: z0(3), z1(3)
+  real, intent(inout) :: c0, c1(3), c2(3,3), c3(3,3,3)
+  real :: c0old, c1old(3), c2old(3,3), c3old(3,3,3)
+  real :: sep1(3), sep2(3,3), sep3(3,3,3)
+  real :: sep1c2comp(3), sep2c3comp(3), sep1c3comp(3,3)
+  
+  c0old = c0
+  c1old = c1
+  c2old = c2
+  c3old = c3
+  !print*, "c0"
+  !print*, c0old
+  !print*, "c1"
+  !print*, c1old
+  !print*, "c2"
+  !print*, c2old
+  !print*, "c3"
+  !print*, c3old(2,1,1)
+  sep1 = 0.
+  sep1 = z1 - z0
+  !print*, "sep1: ", sep1
+  !print*, c2 
+
+  sep1c2comp(1) = sep1(1)*c2(1,1) + sep1(2)*c2(1,2) + sep1(3)*c2(1,3)
+  sep1c2comp(2) = sep1(1)*c2(2,1) + sep1(2)*c2(2,2) + sep1(3)*c2(2,3)
+  sep1c2comp(3) = sep1(1)*c2(3,1) + sep1(2)*c2(3,2) + sep1(3)*c2(3,3)
+
+
+  sep2c3comp(1) = sep1(1)*(sep1(1)*c3(1,1,1) + sep1(2)*c3(1,1,2) + sep1(3)*c3(1,1,3)) &
+                + sep1(2)*(sep1(1)*c3(1,2,1)+ sep1(2)*c3(1,2,2) + sep1(3)*c3(1,2,3)) &
+                + sep1(3)*(sep1(1)*c3(1,3,1)+ sep1(2)*c3(1,3,2) + sep1(3)*c3(1,3,3))
+
+  sep2c3comp(2) = sep1(1)*(sep1(1)*c3(2,1,1) + sep1(2)*c3(2,1,2) + sep1(3)*c3(2,1,3)) &
+                + sep1(2)*(sep1(1)*c3(2,2,1)+ sep1(2)*c3(2,2,2) + sep1(3)*c3(2,2,3)) &
+                + sep1(3)*(sep1(1)*c3(2,3,1)+ sep1(2)*c3(2,3,2) + sep1(3)*c3(2,3,3))
+
+  sep2c3comp(3) = sep1(1)*(sep1(1)*c3(3,1,1) + sep1(2)*c3(3,1,2) + sep1(3)*c3(3,1,3)) &
+                + sep1(2)*(sep1(1)*c3(3,2,1)+ sep1(2)*c3(3,2,2) + sep1(3)*c3(3,2,3)) &
+                + sep1(3)*(sep1(1)*c3(3,3,1)+ sep1(2)*c3(3,3,2) + sep1(3)*c3(3,3,3))
+
+
+  sep1c3comp(1,1) = sep1(1)*c3(1,1,1) + sep1(2)*c3(1,1,2) + sep1(3)*c3(1,1,3)
+  sep1c3comp(1,2) = sep1(1)*c3(1,2,1) + sep1(2)*c3(1,2,2) + sep1(3)*c3(1,2,3)
+  sep1c3comp(1,3) = sep1(1)*c3(1,3,1) + sep1(2)*c3(1,3,2) + sep1(3)*c3(1,3,3)
+  sep1c3comp(2,1) = sep1(1)*c3(2,1,1) + sep1(2)*c3(2,1,2) + sep1(3)*c3(2,1,3)
+  sep1c3comp(2,2) = sep1(1)*c3(2,2,1) + sep1(2)*c3(2,2,2) + sep1(3)*c3(2,2,3)
+  sep1c3comp(2,3) = sep1(1)*c3(2,3,1) + sep1(2)*c3(2,3,2) + sep1(3)*c3(2,3,3)
+  sep1c3comp(3,1) = sep1(1)*c3(3,1,1) + sep1(2)*c3(3,1,2) + sep1(3)*c3(3,1,3)
+  sep1c3comp(3,2) = sep1(1)*c3(3,2,1) + sep1(2)*c3(3,2,2) + sep1(3)*c3(3,2,3)
+  sep1c3comp(3,3) = sep1(1)*c3(3,3,1) + sep1(2)*c3(3,3,2) + sep1(3)*c3(3,3,3)
+
+  !print*, "Second term value: "
+  !print*, 0.5*inner_product2(sep2,c2old)
+  !print*, 0.5*dot_product(sep2,c2old)
+  !print*, "C2 translated"
+  !print*, sep1c2comp
+
+  ! The components of these sums should all have the save order as the coefficent i.e  c0 = scalar, c1 = vector
+  c0 = c0old + dot_product(c1old,sep1) !+ 0.5*inner_product2(sep2,c2old) + 1./6.*inner_product3(sep3,c3)
+  c1 = c1old + sep1c2comp !+ 0.5*sep2c3comp
+  !print*, "c1 is: ",c1
+  c2 = c2old !+ sep1c3comp !+ 0.5*inner_product31_to_2(sep1,c3old)
+  c3 = c3old
+
+ end subroutine translate_expansion_center
 
 !-----------------------------------------------
 !+
@@ -1273,12 +2265,14 @@ subroutine revtree(node, xyzh, ifirstincell, ncells)
 
     i = abs(ifirstincell(icell))
     if (i==0) cycle over_cells
+    print*, icell
 
     ! find centre of mass
     ! this becomes the new node center
     x0 = 0.
     totmass = 0.0
     calc_cofm: do while (i /= 0)
+       print*, "currentpart: ", i 
        xi = xyzh(1,i)
        yi = xyzh(2,i)
        zi = xyzh(3,i)
@@ -1298,6 +2292,7 @@ subroutine revtree(node, xyzh, ifirstincell, ncells)
     node(icell)%xcen(1) = x0(1)
     node(icell)%xcen(2) = x0(2)
     node(icell)%xcen(3) = x0(3)
+    print*, "xcen = ", node(icell) % xcen 
 #endif
 
     i = abs(ifirstincell(icell))
@@ -1309,6 +2304,7 @@ subroutine revtree(node, xyzh, ifirstincell, ncells)
     quads = 0.
 #endif
     over_parts: do while (i /= 0)
+       print*, i 
        xi = xyzh(1,i)
        yi = xyzh(2,i)
        zi = xyzh(3,i)
@@ -1318,6 +2314,7 @@ subroutine revtree(node, xyzh, ifirstincell, ncells)
        dz = zi - node(icell)%xcen(3)
        dr2 = dx*dx + dy*dy + dz*dz
        r2max = max(dr2, r2max)
+       print*, "r2max: ", r2max
        hmax  = max(hi, hmax)
 #ifdef GRAVITY
        if (maxphase==maxp) then
@@ -1332,9 +2329,11 @@ subroutine revtree(node, xyzh, ifirstincell, ncells)
 #endif
        ! move to next particle in list
        i = abs(ll(i))
+       print*, "next part is: ", i 
     enddo over_parts
 
     node(icell)%size = sqrt(r2max) + epsilon(r2max)
+    print*, "node size: ",node(icell)%size
     node(icell)%hmax = hmax
 #ifdef GRAVITY
     node(icell)%mass = totmass
@@ -1416,7 +2415,8 @@ subroutine add_child_nodes(l,r,nodei)
  nodei%xcen = (xl*ml + xr*mr)*dm
  ! size, formula as in Benz et al. 1990
  ! and from thinking about it...
- nodei%size = max(ml*dm*dr+sr,mr*dm*dr+sl)
+ !nodei%size = max(ml*dm*dr+sr,mr*dm*dr+sl)
+ nodei%maxsize = max(ml*dm*dr+sr,mr*dm*dr+sl) ! size is replaced with max size 
 #else
  ! distance between left child and node centre
  dx = xl(1) - nodei%xcen(1)
@@ -1653,5 +2653,620 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
 
 end subroutine maketreeglobal
 
+#endif 
+
+subroutine global_to_local(stack,stacklocal,threadnumber,istacklocal,top)
+  type(denstreestack), intent(inout) :: stack(:)
+  type(denstreestacklocal), intent(inout) :: stacklocal(:)
+  integer, intent(in) :: threadnumber
+  integer, intent(inout) :: istacklocal(:),top 
+  integer :: theinteractions(2), thenode,i 
+
+  ! POP FROM GLOBAL AND PUSH TO LOCAL STACK 
+
+  thenode = 0 
+  theinteractions = 0
+
+  ! POP FROM GLOBAL
+  !!$omp critical (stack)
+  thenode = stack(top) % nodeindex1
+  theinteractions =  stack(top) % interactions
+  ! cleanup interactions
+  stack(top) % interactions = 0
+  stack(top) % nodeindex1 = 0 
+  top = top - 1 
+  !!$omp end critical (stack)
+
+  do i=1,2
+      if (theinteractions(i) /= 0) then 
+      !print*,"i is: ", i
+            istacklocal(threadnumber) = istacklocal(threadnumber) + 1
+            stacklocal(istacklocal(threadnumber)) % nodeindex1 = thenode
+            stacklocal(istacklocal(threadnumber)) % nodeindex2 = theinteractions(i)
+      endif 
+
+
+
+  enddo 
+
+
+
+ end subroutine global_to_local
+
+
+ subroutine get_node_data(currentnode,interactnode,dx,dy,dz,xsizei,xsizej,fnode,totmass_node,quads)
+#ifdef PERIODIC
+ use boundary, only:dxbound,dybound,dzbound
 #endif
+  type(kdnode), intent(in) :: currentnode, interactnode
+  real, intent(out) :: dx,dy,dz,xsizej,xsizei
+  real, optional, intent(out) :: totmass_node, quads(6),fnode(20)
+  real :: xoffset, yoffset, zoffset
+#ifdef PERIODIC
+  real :: hdlx,hdly,hdlz
+
+  hdlx = 0.5*dxbound
+  hdly = 0.5*dybound
+  hdlz = 0.5*dzbound
+#endif
+    dx = currentnode%xcen(1) - interactnode%xcen(1)      ! distance between node centres
+    dy = currentnode%xcen(2) - interactnode%xcen(2)
+#ifndef TREEVIZ
+    dz = currentnode%xcen(3) - interactnode%xcen(3)
+#endif
+    xsizej       = interactnode%size
+    xsizei       = currentnode%size 
+    !hmax         = node(n)%hmax
+    !il           = node(n)%leftchild
+    !ir           = node(n)%rightchild
+#ifdef GRAVITY
+    if (present(fnode)) then 
+      totmass_node =  interactnode%mass
+      quads        =  interactnode%quads
+      !fnode        = currentnode % fnode
+      fnode = 0. 
+    endif 
+#endif
+    !call get_child_nodes(n,il,ir)
+    xoffset = 0.
+    yoffset = 0.
+    zoffset = 0.
+#ifdef PERIODIC
+    if (abs(dx) > hdlx) then            ! mod distances across boundary if periodic BCs
+       xoffset = dxbound*SIGN(1.0,dx)
+       dx = dx - xoffset
+    endif
+    if (abs(dy) > hdly) then
+       yoffset = dybound*SIGN(1.0,dy)
+       dy = dy - yoffset
+    endif
+    if (abs(dz) > hdlz) then
+       zoffset = dzbound*SIGN(1.0,dz)
+       dz = dz - zoffset
+    endif
+#endif
+end subroutine get_node_data
+
+logical function well_separated(node1,node2) result(bool)
+  use dtypekdtree, only:kdnode
+  type(kdnode), intent(in) :: node1, node2
+  real :: cm1(3), cm2(3), dx(3), zmag
+  real :: theta,rmax1,rmax2
+  !logical :: bool
+
+  !bool =.true.
+  !return 
+  theta = 1.0
+
+  cm1 = node1 % xcen
+  cm2 = node2 % xcen 
+
+  ! Get the magnitude of the difference between CoM's
+  dx = cm1 - cm2
+  !print*,dx
+  zmag = sqrt(dx(1)*dx(1) + dx(2)*dx(2)+ dx(3)*dx(3))
+
+  ! get the rmax for nodes 1 and 2
+  ! Change to sizemax 
+  rmax1 = node1 % maxsize
+  rmax2 = node2 % maxsize
+  !call distance_to_corner(node1,rmax1)
+  !call distance_to_corner(node2,rmax2)
+
+
+  !print*, "Rmax values: "
+  !print*, rmax1, rmax2
+
+   !print*,"Zmag: ", zmag
+   !print*, "rmax1 + rmax2/theta: ", (rmax1 + rmax2)/theta
+   if (theta == 0.0) then 
+     bool = .FALSE.
+     return 
+   endif 
+  if (zmag > (rmax1+rmax2)/theta) then
+    bool = .TRUE.
+  else 
+    bool = .FALSE.
+  endif  
+
+
+
+end function well_separated
+
+ subroutine direct_sum_not_neighbour(currentnodeindex, interactnodeindex,fxyzu_dtt,poten_dtt,xyzh,node,ifirstincell)
+  use part, only :massoftype,maxphase,iamtype,iphase
+  use dim,  only :maxp
+  integer, intent(in) :: currentnodeindex, interactnodeindex, ifirstincell(:)
+  type(kdnode), intent(in) :: node(:)
+  real, intent(inout) :: fxyzu_dtt(:,:), poten_dtt(:)
+  real, intent(in)    :: xyzh(:,:)
+  integer :: currentnodepart(500), interactnodepart(500)
+  integer :: npcurrent, npinteract 
+  integer :: i, j, indexi,indexj
+  integer :: iamtypej
+  real    :: dx,dy,dz,rij2,rij1,fgrav,fgravj,pmassj,phii
+
+  currentnodepart = 0.
+  interactnodepart = 0.
+  npcurrent = 0.
+  npinteract = 0.
+  dx = 0 
+  dy = 0
+  dz = 0
+  rij2 = 0.
+  rij1 = 0.
+  fgrav = 0.
+  fgravj = 0.
+  pmassj = 0.
+  iamtypej = 0
+  i = 0
+  j = 0
+  indexi = 0
+  indexj = 0 
+  phii = 0.
+
+  !print*, "enetered direct"
+  ! find particles in each cell 
+  ! DEBUG THIS SUBROUTINE 
+  call get_part_node(currentnodeindex,node,ifirstincell,currentnodepart,npcurrent)
+  call get_part_node(interactnodeindex,node,ifirstincell,interactnodepart,npinteract)
+
+   !print*, "Got particles: ", currentnodepart(1:npcurrent), interactnodepart(1:npinteract)
+  ! ! compute direct sum 
+  ! print*, "node index: ", currentnodeindex, interactnodeindex
+  !print*, npcurrent, npinteract
+  do i=1, npcurrent
+    indexi = currentnodepart(i)
+    !print*, "indexi: ", indexi
+    do j=1, npinteract
+      indexj = interactnodepart(j)
+      !print*, "indexj: ", indexj
+       if (indexj == 1) then 
+     !print*, interactnodeindex
+     !stop 
+    endif 
+      if (indexi /= indexj) then 
+        !print*, "calc"
+        !if (indexi == 94) print*, "indexj: ", indexj, "currentnodeindex: ", currentnodeindex, &
+        !"interactnodeindex: ", interactnodeindex, &
+        ! "ifirstincell",ifirstincell(interactnodeindex)
+      dx = xyzh(1,indexi) - xyzh(1,indexj)
+      dy = xyzh(2,indexi) - xyzh(2,indexj)
+      dz = xyzh(3,indexi) - xyzh(3,indexj)
+      ! find rij2 by squaring distance of particles 
+      rij2 = dx*dx + dy*dy + dz*dz 
+      ! print*, indexi, indexj
+      ! !print*,"rij2:", rij2
+#ifdef FINVSQRT
+       rij1 = finvsqrt(rij2)
+#else
+       rij1 = 1./sqrt(rij2)
+#endif
+       fgrav  = rij1*rij1*rij1
+       if (maxphase==maxp) then
+          iamtypej = iamtype(iphase(indexj))
+       endif
+       pmassj = massoftype(iamtypej)
+       phii   = -rij1
+       fgravj = fgrav*pmassj
+       ! print*, fgravj
+       ! print*, indexi
+       ! ! Instead of fsum append directly to fxyzu
+       ! print*, fxyzu(1,indexi)
+       !if (isnan(fxyzu(1,indexi))) stop 
+       ! should be omp lock here 
+       !$omp critical (direct)
+       fxyzu_dtt(1,indexi) = fxyzu_dtt(1, indexi) - dx*fgravj
+       fxyzu_dtt(2, indexi) = fxyzu_dtt(2, indexi) - dy*fgravj
+       fxyzu_dtt(3, indexi) = fxyzu_dtt(3, indexi) - dz*fgravj
+       poten_dtt(indexi) = poten_dtt(indexi) + pmassj*phii
+       !print*, "poten: ", poten_dtt(indexi)
+       !$omp end critical (direct)
+     endif 
+
+    end do 
+  end do 
+
+
+
+
+ end subroutine direct_sum_not_neighbour
+
+ subroutine get_part_node(nodeindex,node,ifirstincell,part,nopart)
+  type(kdnode), intent(in) :: node(:)
+  integer,      intent(in) :: nodeindex, ifirstincell(:)
+  integer,     intent(out) :: nopart,part(500)
+  integer, parameter :: maxstacksize = 100
+  integer :: nstack(maxstacksize), istack,n,npnode,currentindex
+  integer :: il,ir,ipart,i1,i2,j
+
+
+  npnode = 0.
+  nopart = 0.
+  nstack = 0.
+  istack = 1
+  part = 0.
+  ! Push nodeindex to stack 
+  nstack(istack) = nodeindex
+
+  do while (istack /= 0)
+    !print*, "istack is: ", istack 
+    n = nstack(istack)
+    istack = istack - 1 
+    il      = node(n)%leftchild
+    ir      = node(n)%rightchild
+    if (ifirstincell(n) /= 0) then
+      ! leafnode, add to particles 
+      i1=inoderange(1,n)
+      i2=inoderange(2,n)
+      npnode = i2 - i1 + 1
+      do j=1,npnode
+        part(nopart+j) = abs(inodeparts(inoderange(1,n)+j-1))
+      enddo
+      nopart = nopart + npnode 
+    else 
+        if (il /= 0) then
+             istack = istack + 1
+             nstack(istack) = il
+          endif
+          if (ir /= 0) then
+             istack = istack + 1
+             nstack(istack) = ir
+          endif 
+
+    endif 
+
+  enddo 
+
+
+ end subroutine get_part_node
+logical function check_parent_overlap(node,currentnodeindex,interactnodeindex)
+#ifdef PERIODIC
+ use boundary, only:dxbound,dybound,dzbound
+#endif
+ use kernel, only: radkern
+ type(kdnode), intent(in) :: node(:)
+ integer, intent(in) :: currentnodeindex, interactnodeindex
+ integer :: n 
+ real :: dx,dy,dz,r2,rcut,rcut2,rcuti,rcutj,xpos(3),xoffset,yoffset,zoffset
+ real :: xsizei,xsizej
+#ifdef PERIODIC
+ real :: hdlx,hdly,hdlz
+
+ hdlx = 0.5*dxbound
+ hdly = 0.5*dybound
+ hdlz = 0.5*dzbound
+#endif
+    ! Setup data for current node index 
+    xpos = node(currentnodeindex) % xcen
+    xsizei = node(currentnodeindex) % size 
+    rcuti = radkern*node(currentnodeindex)%hmax
+
+    ! start with the parent of the node we are interacting with 
+    n = node(interactnodeindex) % parent 
+
+    do while(n /= 1) ! Traverse till root 
+      dx = xpos(1) - node(n)%xcen(1)      ! distance between node centres
+      dy = xpos(2) - node(n)%xcen(2)
+#ifndef TREEVIZ
+      dz = xpos(3) - node(n)%xcen(3)
+#endif
+      xsizej       = node(n)%size
+#ifdef PERIODIC
+      if (abs(dx) > hdlx) then            ! mod distances across boundary if periodic BCs
+        xoffset = dxbound*SIGN(1.0,dx)
+        dx = dx - xoffset
+      endif
+      if (abs(dy) > hdly) then
+        yoffset = dybound*SIGN(1.0,dy)
+        dy = dy - yoffset
+      endif
+      if (abs(dz) > hdlz) then
+        zoffset = dzbound*SIGN(1.0,dz)
+        dz = dz - zoffset
+      endif
+#endif
+      r2    = dx*dx + dy*dy + dz*dz !+ xsizei*xsizei
+      !if (get_hj) then  ! find neighbours within both hi and hj
+      rcutj = radkern*node(n)%hmax
+      rcut  = max(rcuti,rcutj)
+    !endif
+
+
+      rcut2 = (xsizei + xsizej + rcut)**2   ! node size + search radius
+
+      ! If parents dont overlap this interaction must be added 
+      ! return false 
+      if (r2>=rcut2) then 
+        check_parent_overlap =  .false.
+        return 
+      endif 
+
+      ! otherwise check overlap up to root 
+      n = node(n) % parent 
+
+    enddo 
+
+    ! if root has been reached then nodes overlap
+    check_parent_overlap = .true.
+
+
+end function check_parent_overlap
+
+subroutine get_child_leaf(nodeindex,node,ifirstincell,childleaf,childleafcounter)
+  integer, intent(in) :: nodeindex, ifirstincell(:)
+  type(kdnode), intent(in) :: node(:)
+  integer, intent(out) :: childleaf(100), childleafcounter
+  integer :: n, istack, nstack(100)
+  integer :: il,ir 
+
+  childleafcounter = 0
+  childleaf = 0
+  istack = 1
+  nstack(istack) = nodeindex 
+
+  do while (istack /= 0)
+    n = nstack(istack)
+    istack = istack - 1
+    !print*, n
+    il = node(n) % leftchild
+    ir = node(n) % rightchild
+    if (ifirstincell(n) > 0) then ! If Leaf, add to childleaf 
+      childleafcounter = childleafcounter + 1 
+      childleaf(childleafcounter) = n 
+      
+
+    else 
+       if (il > 0) then
+             istack = istack + 1
+             nstack(istack) = il
+          endif
+          if (ir > 0) then
+             istack = istack + 1
+             nstack(istack) = ir
+          endif
+    endif 
+
+
+  enddo 
+
+
+
+end subroutine get_child_leaf
+
+subroutine push_local(nodeindex1,nodeindex2,stacklocal,istacklocal,k)
+  integer, intent(in) :: nodeindex1, nodeindex2,k
+  integer, intent(inout) :: istacklocal(:)
+  type(denstreestacklocal), intent(inout) :: stacklocal(:)
+
+  ! Increment stack pointer
+  istacklocal(k) = istacklocal(k) + 1 
+  ! push nodes 
+  stacklocal(istacklocal(k)) % nodeindex1 = nodeindex1
+  stacklocal(istacklocal(k)) % nodeindex2 = nodeindex2
+
+
+end subroutine push_local
+
+subroutine pop_local(nodeindex1,nodeindex2, stacklocal, istacklocal,k)
+  integer, intent(out) :: nodeindex1, nodeindex2
+  integer, intent(inout) :: istacklocal(:)
+  type(denstreestacklocal), intent(inout) :: stacklocal(:)
+  integer, intent(in) :: k 
+
+  ! pop nodes 
+  nodeindex1 = stacklocal(istacklocal(k)) % nodeindex1 
+  nodeindex2 = stacklocal(istacklocal(k)) % nodeindex2 
+
+  ! Decrement stack pointer 
+  istacklocal(k) = istacklocal(k) - 1 
+
+end subroutine pop_local
+
+subroutine push_global(thenode, interaction1, interaction2,stack,top)
+  integer, intent(in) :: thenode, interaction1, interaction2
+  integer, intent(inout) :: top 
+  type(denstreestack), intent(inout) :: stack(:)
+
+  top = top + 1 
+  stack(top) % nodeindex1 = thenode
+  stack(top) % interactions(1) = interaction1
+  stack(top) % interactions(2) = interaction2
+
+end subroutine push_global
+
+logical function not_sph_neighbour(node,nodeindex1,nodeindex2,r2,rcut2)
+  type(kdnode), intent(in) :: node(:)
+  integer, intent(in) :: nodeindex1,nodeindex2
+  real, intent(in) :: r2,rcut2
+
+  if (r2 < rcut2 .and. (node(nodeindex1) % leftchild == 0 .and. node(nodeindex1) % rightchild == 0)) then 
+    not_sph_neighbour = .not. check_parent_overlap(node,nodeindex1,nodeindex2)
+  else if ( r2 >= rcut2) then 
+    not_sph_neighbour =  .true.
+  endif 
+
+end function not_sph_neighbour
+
+logical function check_leaf_overlap(node,currentnodeindex,interactnodeindex)
+ type(kdnode), intent(in) :: node
+ integer, intent(in) :: currentnodeindex, interactnodeindex
+ integer :: childleaf(100), childleafcounter
+
+ !call get_child_leaf(nodeindex,node,ifirstincell,childleaf,childleafcounter) 
+
+
+
+end function check_leaf_overlap
+
+logical function check_child_overlap(node,currentnodeindex,interactnodeindex) result(overlap)
+ use kernel, only: radkern
+ type(kdnode), intent(in) :: node(:)
+ integer, intent(in) :: currentnodeindex, interactnodeindex
+ integer :: leftchildindex, rightchildindex
+ real    :: r2,rcut2,dx,dy,dz,rcuti,rcutj,rcut,xsizei,xsizej
+ logical :: overlapleft, overlapright 
+
+ leftchildindex = node(currentnodeindex) % leftchild
+ rightchildindex = node(currentnodeindex) % rightchild
+
+ ! Check overlap of left child first 
+
+ call get_node_data(node(leftchildindex),node(interactnodeindex),dx,dy,dz,xsizei,xsizej)
+
+ r2 = dx*dx + dy*dy + dz*dz 
+
+ rcutj = radkern*node(interactnodeindex) % hmax
+ rcuti = radkern*node(leftchildindex) % hmax 
+ rcut  = max(rcuti,rcutj)
+ !rcut = rcuti
+ rcut2 = (xsizei + xsizej + rcut)**2 
+
+ overlapleft = r2 < rcut2 
+
+ call get_node_data(node(rightchildindex),node(interactnodeindex),dx,dy,dz,xsizei,xsizej)
+
+ r2 = dx*dx + dy*dy + dz*dz 
+
+ rcutj = radkern*node(interactnodeindex) % hmax
+ rcuti = radkern*node(rightchildindex) % hmax 
+ rcut  = max(rcuti,rcutj)
+ !rcut = rcuti
+ rcut2 = (xsizei + xsizej + rcut)**2 
+
+ overlapright = r2 < rcut2 
+
+ !print*, "overlapright: ", overlapright
+ !print*, "overlapleft: ", overlapleft
+ overlap = overlapleft .or. overlapright
+
+
+end function check_child_overlap
+
+
+subroutine get_nodesize_max(node, xyzh, ifirstincell, ncells)
+ use dim,  only:maxp
+ use part, only:maxphase,iphase,igas,massoftype,iamtype
+ use io,   only:fatal
+ type(kdnode), intent(inout) :: node(:) !ncellsmax+1)
+ real,    intent(in)  :: xyzh(:,:)
+ integer, intent(in)  :: ifirstincell(:) !ncellsmax+1)
+ integer(kind=8), intent(in) :: ncells
+ real :: hmax, r2max
+ real :: xi, yi, zi, hi
+ real :: dx, dy, dz, dr2
+#ifdef GRAVITY
+ real :: quads(6)
+#endif
+ integer :: icell, i, level, il, ir
+ real :: pmassi, totmass
+ real :: x0(3)
+ type(kdnode) :: nodel,noder
+
+ pmassi = massoftype(igas)
+
+
+!$omp parallel default(none) &
+!$omp shared(maxp,maxphase) &
+!$omp shared(xyzh, ifirstincell, ncells) &
+!$omp shared(node, ll, iphase, massoftype, maxlevel,maxlevel_indexed) &
+!$omp private(hmax, r2max, xi, yi, zi, hi, il, ir, nodel, noder) &
+!$omp private(dx, dy, dz, dr2, icell, i, x0) &
+#ifdef GRAVITY
+!$omp private(quads) &
+#endif
+!$omp firstprivate(pmassi) &
+!$omp private(totmass)
+
+!
+! propagate information to parent nodes
+! here we sweep across each level at a time
+! and update each node from its two children
+!
+ ! do level=maxlevel-1,maxlevel_indexed-1,-1
+ !   print*, "level: ", level 
+ !   print*, 2**maxlevel_indexed, nnodes
+ !  do i=2**maxlevel_indexed, nnodes 
+ !    if (node(i) % level == level) then 
+
+
+ !    endif 
+
+ !  enddo 
+
+ ! enddo 
+ !do level=min(maxlevel_indexed,maxlevel-1),0,-1
+  do level=maxlevel-1,0,-1
+   !print*, "level: ", level 
+   !print*, 2**maxlevel_indexed, nnodes
+   !print*, 2**level,2**(level+1)-1
+!$omp do
+    ! 1 to nnodes for level > maxlevel 
+    do i=2**level,2**(level+1)-1
+
+       ! get child nodes
+       il = node(i)%leftchild
+       ir = node(i)%rightchild
+       if (il > 0 .and. ir > 0) then
+          nodel = node(il)
+          noder = node(ir)
+          call add_child_nodes(nodel,noder,node(i))
+       else
+          if (il > 0 .or. ir > 0) then
+             ! should never happen, should have two children or none
+             call fatal('revtree','node with only one child during tree revision',var='ir',ival=ir)
+          endif
+       endif
+    enddo
+!$omp enddo
+ enddo
+!$omp end parallel
+
+
+
+end subroutine get_nodesize_max
+
+
+ ! recursive subroutine get_node_radius(node,ifirstincell,n,radius)
+ !  use kernel, only: radkern
+ !  type(kdnode), intent(in) :: node(:)
+ !  integer, intent(inout) :: n
+ !  integer, intent(in) :: ifirstincell(:)
+
+ !  real, intent(inout) :: radius 
+ !  real :: sizel, sizer
+
+ !    if (ifirstincell(n) /= 0) then 
+ !      radius = node(n) % size + node(n) % hmax*radkern
+ !    else 
+ !      ! get search radius of left child 
+ !      call get_node_radius(node,ifirstincell,node(n)%leftchild,sizel)
+ !      ! get search radius of right child 
+ !      call get_node_radius(node,ifirstincell,node(n)%rightchild,sizer)
+
+ !      radius = max(sizel,sizer)
+
+ !    endif 
+
+ ! end subroutine get_node_radius
 end module kdtree
