@@ -297,7 +297,7 @@ subroutine getneigh_pos(xpos,xsizei,rcuti,ndim,mylistneigh,nneigh,xyzh,xyzcache,
 end subroutine getneigh_pos
 
 subroutine get_long_range(xyzh,fxyzu_dtt,poten_dtt,nonodesfound)
-  use kdtree, only: evaluate, interact,revtree 
+  use kdtree, only: evaluate, interact,interact_standalone,revtree 
   real, intent(in) :: xyzh(:,:)
   real, intent(inout) :: fxyzu_dtt(:,:), poten_dtt(:)
   integer, optional, intent(out) :: nonodesfound(:)
@@ -305,7 +305,8 @@ subroutine get_long_range(xyzh,fxyzu_dtt,poten_dtt,nonodesfound)
 
 
   ! Get long range coefficients
-  call interact(node,ifirstincell,xyzh,fxyzu_dtt,poten_dtt,nonodesfound)
+  call interact(node,ifirstincell,xyzh,fxyzu_dtt,poten_dtt)!,nonodesfound)
+  !call interact_standalone(node,ifirstincell,xyzh,fxyzu_dtt,poten_dtt,nonodesfound)
   ! Pass down tree 
 
   ! THIS IS THE MEM ALLOCATE BUG 

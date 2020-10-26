@@ -227,7 +227,8 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 
 #ifdef GRAVITY
  real, allocatable           :: fxyzu_dtt(:,:),poten_dtt(:)
- integer, allocatable        :: nonodesfound(:)
+ real                        :: allocatestart,allocatefinish
+ !integer, allocatable        :: nonodesfound(:)
 #endif 
  integer                     :: noleaf,leafnodeindex 
  integer                     :: neighbours_tree, neighbours_actual,neighbours_found
@@ -415,30 +416,36 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 
 ! Allocate force array for dtt 
 #ifdef GRAVITY 
-
+if (.not. allocated(fxyzu_dtt)) then 
+! Check allocation time 
+call cpu_time(allocatestart)
 allocate(fxyzu_dtt(maxvxyzu, maxan))
 allocate(poten_dtt(maxan))
-allocate(nonodesfound(maxan))
+call cpu_time(allocatefinish)
+print*, "allocation time: ", allocatefinish-allocatestart
+! Check allocation time
+!allocate(nonodesfound(maxan))
+endif 
 fxyzu_dtt = 0.
 poten_dtt = 0.
-nonodesfound = 0 
+!nonodesfound = 0 
 
 do i=1, int(ncells)
-  node(i) % fnode = 0.
+node(i) % fnode = 0.
 enddo  
 
 
-call get_long_range(xyzh,fxyzu_dtt,poten_dtt,nonodesfound)
+call get_long_range(xyzh,fxyzu_dtt,poten_dtt)!,nonodesfound)
 #endif 
 
-noleaf = 0 
-do i=1, int(ncells)
-  if (ifirstincell(i) > 0) then
-    !print*, i
-    !stop 
-    noleaf = noleaf + 1 
-  endif 
-enddo 
+! noleaf = 0 
+! do i=1, int(ncells)
+!   if (ifirstincell(i) > 0) then
+!     !print*, i
+!     !stop 
+!     noleaf = noleaf + 1 
+!   endif 
+! enddo 
 !print*, "number of leaf nodes: ", noleaf
 !stop 
 !-- verification for non-ideal MHD
@@ -488,6 +495,7 @@ enddo
 !$omp shared(xyzmh_ptmass,nptmass) &
 !$omp shared(rhomax,ipart_rhomax,icreate_sinks,rho_crit,r_crit2) &
 !$omp private(rhomax_thread,ipart_rhomax_thread,use_part,j) &
+!$omp shared(fxyzu_dtt,poten_dtt) &
 #endif
 #ifdef MPI
 !$omp shared(id) &
@@ -517,7 +525,8 @@ enddo
 !$omp shared(ddustevol) &
 !$omp shared(deltav) &
 !$omp shared(ibin_wake,ibinnow_m1) & 
-!$omp shared(nonodesfound,neighbours_found)
+!!$omp shared(nonodesfound,noleaf) &
+!$omp private(neighbours_found)
 
 !$omp do schedule(runtime)
  over_cells: do icell=1,int(ncells)
@@ -537,17 +546,25 @@ enddo
     call get_cell_location(icell,cell%xpos,cell%xsizei,cell%rcuti)
     !
     !--get the neighbour list and fill the cell cache
-    !if (icell==285) then 
+    !if (icell==66568) then 
       !print*, cell % hmax 
       !stop 
       !print*,"icell: ", icell
+     neighbours_found = 0 
+     nneigh = 0 
      call get_neighbour_list(icell,listneigh,nneigh,xyzh,xyzcache,maxcellcache,getj=.true., &
 #ifdef GRAVITY
                            f=cell%fgrav, &
 #endif
                            remote_export=remote_export,neighbours_found=neighbours_found)
       cell % fgrav = node(icell) % fnode
-    !print*, "total number of interactions on leaf: ", nonodesfound(icell) + neighbours_found
+    ! print*, "current cell is: ", icell
+    ! print*, "interactions neighbour finding: ", neighbours_found
+    ! print*, "nonodesfound: ", nonodesfound(icell)
+    ! print*, "total number of interactions on leaf: ", nonodesfound(icell) + neighbours_found
+    ! print*, "number of leaf nodes: ", noleaf
+    !if (noleaf /= nonodesfound(icell) + neighbours_found) stop 
+
     !endif 
 #ifdef GRAVITY
     
@@ -752,12 +769,13 @@ enddo
     endif
  endif
 #endif
-!$omp end parallel
+
 
 #ifdef GRAVITY
  
 !ADD LONG RANGE CONTRIBUTION 
 !iamtypei = igas  
+!$omp do 
 do i=1, npart 
   if (maxphase==maxp) then
           iamtypei = iamtype(iphase(i))
@@ -771,10 +789,11 @@ do i=1, npart
   !if (isnan(poten(i))) stop 
 
 enddo 
-
-deallocate(poten_dtt)
-deallocate(fxyzu_dtt)
+!$omp enddo 
 #endif
+!$omp end parallel
+
+
 
 #ifdef IND_TIMESTEPS
  ! check for nbinmaxnew = 0, can happen if all particles

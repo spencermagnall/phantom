@@ -61,6 +61,9 @@ subroutine test_gravity(ntests,npass,string)
  real :: dr,phiexact,phi,dr2,pmassi,epoti,tol,tree_acc_prev
  real :: p(3),pmag
 
+ ! test coefficent translation 
+ call test_expan_trans()
+
  if (id==master) write(*,"(/,a,/)") '--> TESTING SELF-GRAVITY'
 
  testdirectsum    = .false.
@@ -243,7 +246,7 @@ subroutine test_gravity(ntests,npass,string)
 !--setup particles
 !
           call init_part()
-          np       = 1000
+          np       = 1000000
           maxvxyzu = size(vxyzu(:,1))
           totvol   = 4./3.*pi*rmax**3
           nx       = int(np**(1./3.))
@@ -291,7 +294,7 @@ subroutine test_gravity(ntests,npass,string)
 !
 !--compute gravitational forces by direct summation
 !
-          call directsum_grav(xyzh,gradh,vxyzu,phitot,npart)
+          !call directsum_grav(xyzh,gradh,vxyzu,phitot,npart)
 !
 !--compare the results
 !
@@ -378,5 +381,98 @@ subroutine get_finite_diff(ndim,x0,xposj,totmass,quads,fnode,dfdx,dpot,d2f,eps)
 
 end subroutine get_finite_diff
 #endif
+
+subroutine test_expan_trans()
+  use kdtree,    only:compute_fnode,translate_fgrav_in_taylor_series
+  real :: xposi(3),xposil(3),xposir(3)
+  real :: xposj(3),xposjl(3),xposjr(3)
+  real :: massnode,masschild
+  real :: dx(3),dr,totmass
+  real :: quads(6), fnode1(20), fnode2(20), fnodechild1l(20),fnodechild1r(20),fnodechild2l(20),fnodechild2r(20)
+  real :: forcenode1(3),forceleft1(3),forceright1(3),forcenode2(3),forceleft2(3),forceright2(3)
+
+  totmass = 1. 
+
+  xposi = (/1.,0.,0./)
+  xposil = (/0.5,0.,0./)
+  xposir = (/1.5,0.,0./)
+
+  xposj = (/-1.,0.,0./)
+  xposjl = (/-1.5,0.,0./)
+  xposjr = (/-0.5,0.,0./)
+
+  ! get the distance between parent well separated nodes 
+  call get_dx_dr(xposi,xposj,dx,dr)
+  ! Compute tensor fields
+  fnode1 = 0.
+  quads = 0. 
+  call compute_fnode(dx(1),dx(2),dx(3),dr,totmass,quads,fnode1)
+
+  forcenode1 = totmass*fnode1(1:3)
+
+  ! perform the same calculation for node 2 
+
+  ! get the distance between parent well separated nodes 
+  call get_dx_dr(xposj,xposi,dx,dr)
+  ! Compute tensor fields
+  fnode2 = 0.
+  quads = 0. 
+  call compute_fnode(dx(1),dx(2),dx(3),dr,totmass,quads,fnode2)
+  forcenode2 = totmass*fnode2(1:3)
+
+  ! check that forces are equal and opposite 
+  print*, "forcenode1: ", forcenode1
+  print*, "forcenode2: ", forcenode2
+  if (abs(forcenode1(1)) /= abs(forcenode2(1))) stop
+  if (abs(forcenode1(2)) /= abs(forcenode2(2))) stop
+  if (abs(forcenode1(3)) /= abs(forcenode2(3))) stop
+
+  ! translate force on node one to children 
+  call get_dx_dr(xposil,xposi,dx,dr)
+  fnodechild1l = fnode1
+  call translate_fgrav_in_taylor_series(fnodechild1l,dx(1),dx(2),dx(3))
+  forceleft1(1) = fnodechild1l(1)*0.5
+  forceleft1(2) = fnodechild1l(2)*0.5
+  forceleft1(3) = fnodechild1l(3)*0.5
+  call get_dx_dr(xposir,xposi,dx,dr)
+  fnodechild1r = fnode1
+  call translate_fgrav_in_taylor_series(fnodechild1r,dx(1),dx(2),dx(3))
+  forceright1(1) = fnodechild1r(1)*0.5
+  forceright1(2) = fnodechild1r(2)*0.5
+  forceright1(3) = fnodechild1r(3)*0.5
+
+  print*, "left force: ", forceleft1
+  print*, "right force: ", forceright1
+  print*, "Sum of child forces: ", forceleft1 + forceright1
+  print*, "Node force: ", forcenode1
+
+
+  call get_dx_dr(xposjl,xposj,dx,dr)
+  fnodechild2l = fnode2
+  call translate_fgrav_in_taylor_series(fnodechild2l,dx(1),dx(2),dx(3))
+  forceleft2(1) = fnodechild2l(1)*0.5
+  forceleft2(2) = fnodechild2l(2)*0.5
+  forceleft2(3) = fnodechild2l(3)*0.5
+  call get_dx_dr(xposjr,xposj,dx,dr)
+  fnodechild2r = fnode2
+  call translate_fgrav_in_taylor_series(fnodechild2r,dx(1),dx(2),dx(3))
+  forceright2(1) = fnodechild2r(1)*0.5
+  forceright2(2) = fnodechild2r(2)*0.5
+  forceright2(3) = fnodechild2r(3)*0.5
+
+  print*, "left force: ", forceleft2
+  print*, "right force: ", forceright2
+  print*, "Sum of child forces: ", forceleft2 + forceright2
+  print*, "Node force: ", forcenode2
+
+  print*, "total force sum: ", forcenode1 + forcenode2
+
+
+   
+
+  !stop 
+
+
+end subroutine test_expan_trans
 
 end module testgravity
