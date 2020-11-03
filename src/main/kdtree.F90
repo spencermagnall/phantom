@@ -1347,7 +1347,7 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
 
 #ifdef GRAVITY
        ! This should be a lock but this will do for now 
-       !$omp critical (node)
+       !$omp critical (node_critical)
        !print*, "fnode before: ", fnode(1:3)
        !fnode = node(nodeindex1) % fnode 
        fnode = 0. 
@@ -1386,7 +1386,7 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
        ! call compute_fnode(dx,dy,dz,dr,totmass_node,quads,fnode)
        !  print*, "force on node2 is: ", fnode(1)*node(nodeindex2) % mass, &
        ! fnode(2)*node(nodeindex2) % mass, fnode(3)*node(nodeindex2) % mass
-       !$omp end critical (node)
+       !$omp end critical (node_critical)
 #endif 
        !endif 
 
@@ -1669,7 +1669,7 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
         !!$omp critical  
 
     else 
-      !$omp critical (stack)
+      !$omp critical (stack_critical)
       if (top > 0) then 
         !!$OMP TASK 
        ! nodeindex1 = stack(top) % nodeindex1
@@ -1693,7 +1693,7 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
         threadworking(k) = .false.
         idlecounts(k) = idlecounts(k) + 1
       endif
-      !$omp end critical (stack)
+      !$omp end critical (stack_critical)
     endif 
 
   if (threadworking(k)) then 
@@ -1763,10 +1763,10 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
                         !if (nodeindex1 <  64) then
                           
                           if (top < numthreads) then
-                            !$omp critical (stack) 
+                            !$omp critical (stack_critical) 
                             call push_global(leftindex,leftindex,rightindex,stack,top)
                             call push_global(rightindex,rightindex,leftindex,stack,top)
-                            !$omp end critical (stack)
+                            !$omp end critical (stack_critical)
                           else 
                             call push_local(leftindex,leftindex,stacklocal,istacklocal,k)
                             call push_local(leftindex,rightindex,stacklocal,istacklocal,k)
@@ -1993,9 +1993,9 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
                               
                               if (leftindex /= 0) then 
                                     if (top < numthreads) then 
-                                      !$omp critical (stack)
+                                      !$omp critical (stack_critical)
                                       call push_global(leftindex,regnodeindex,0,stack,top)
-                                      !$omp end critical (stack)
+                                      !$omp end critical (stack_critical)
                                     else 
                                      call push_local(leftindex,regnodeindex,stacklocal,istacklocal,k)
                                     endif 
@@ -2004,9 +2004,9 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
                               !!$omp end critical (stack)
                               if (rightindex /= 0) then 
                                     if (top < numthreads) then 
-                                      !$omp critical (stack)
+                                      !$omp critical (stack_critical)
                                       call push_global(rightindex,regnodeindex,0,stack,top)
-                                      !$omp end critical (stack)
+                                      !$omp end critical (stack_critical)
                                     else
                                       call push_local(rightindex,regnodeindex,stacklocal,istacklocal,k)
                                     endif 
@@ -2061,9 +2061,9 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
                                     ! stack(top) % nodeindex1 = leftindex
                                     ! stack(top) % interactions(1) = splitnodeindex
                                     if (top < numthreads) then 
-                                      !$omp critical (stack)
+                                      !$omp critical (stack_critical)
                                       call push_global(leftindex,splitnodeindex,0,stack,top)
-                                      !$omp end critical (stack)
+                                      !$omp end critical (stack_critical)
                                     else
                                       call push_local(leftindex,splitnodeindex,stacklocal,istacklocal,k)
                                     endif 
@@ -2075,9 +2075,9 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
                                     ! stack(top) % nodeindex1 = rightindex
                                     ! stack(top) % interactions(1) = splitnodeindex
                                     if (top < numthreads) then 
-                                      !$omp critical (stack)
+                                      !$omp critical (stack_critical)
                                       call push_global(rightindex,splitnodeindex,0,stack,top)
-                                      !$omp end critical (stack)
+                                      !$omp end critical (stack_critical)
                                     else 
                                       call push_local(rightindex,splitnodeindex,stacklocal,istacklocal,k)
                                     endif 
