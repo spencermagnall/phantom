@@ -1219,7 +1219,7 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
         !!$omp critical  
 
     else 
-      !$omp critical (stack)
+      !$omp critical (stack_critical)
       if (top > 0) then 
         !!$OMP TASK 
        ! nodeindex1 = stack(top) % nodeindex1
@@ -1241,7 +1241,7 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
       else 
         threadworking(k) = .false.
       endif
-      !$omp end critical (stack)
+      !$omp end critical (stack_critical)
     endif 
 
   if (threadworking(k)) then 
@@ -1291,7 +1291,7 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
                   leftindex = node(nodeindex1) % leftchild
                   rightindex = node(nodeindex1) % rightchild 
 
-                  !$omp critical (stack)
+                  !$omp critical (stack_critical)
 
                   if (leftindex /= 0 .and. rightindex /= 0) then 
                         ! top = top + 1
@@ -1309,7 +1309,7 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
                         call push_global(rightindex,rightindex,leftindex,stack,top)
                   endif 
 
-                  !$omp end critical (stack)
+                  !$omp end critical (stack_critical)
 
         endif
 
@@ -1433,14 +1433,14 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
 
                         ! If splitting nodeindex1  push to global stack 
                         if (nodeindex1 == splitnodeindex) then 
-                              !$omp critical (stack)
+                              !$omp critical (stack_critical)
                               if (leftindex /= 0) then 
                                     call push_global(leftindex,regnodeindex,0,stack,top)
                               endif 
                               if (rightindex /= 0) then 
                                     call push_global(rightindex,regnodeindex,0,stack,top)
                               endif 
-                              !$omp end critical (stack)
+                              !$omp end critical (stack_critical)
 
                         ! Otherwise if splitting nodeindex2 keep interactions on local stack 
                         else 
@@ -1478,7 +1478,7 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
 
                          ! If splitting node push to global stack 
                         if (nodeindex1 == regnodeindex) then 
-                              !$omp critical (stack)
+                              !$omp critical (stack_critical)
                               if (leftindex /= 0) then 
                                     ! top = top + 1
                                     ! stack(top) % nodeindex1 = leftindex
@@ -1491,7 +1491,7 @@ do while (any(istacklocal > 0) .or. top > 0 .or. any(threadworking))
                                     ! stack(top) % interactions(1) = splitnodeindex
                                     call push_global(rightindex,splitnodeindex,0,stack,top)
                               endif 
-                              !$omp end critical (stack)
+                              !$omp end critical (stack_critical)
 
                         else 
                   
