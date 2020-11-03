@@ -306,6 +306,7 @@ subroutine get_long_range(xyzh,fxyzu_dtt,poten_dtt,nonodesfound)
 
   ! Get long range coefficients
   call interact(node,ifirstincell,xyzh,fxyzu_dtt,poten_dtt)!,nonodesfound)
+  print*,"interact finished"
   !call interact_standalone(node,ifirstincell,xyzh,fxyzu_dtt,poten_dtt,nonodesfound)
   ! Pass down tree 
 
